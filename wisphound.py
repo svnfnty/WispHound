@@ -381,10 +381,11 @@ class PixiewpsData:
                 and self.e_hash1 and self.e_hash2)
 
     def get_pixie_cmd(self, full_range=False):
-        pixiecmd = "pixiewps --pke {} --pkr {} --e-hash1 {}"\ 
-                    " --e-hash2 {} --authkey {} --e-nonce {}".format(
-                    self.pke, self.pkr, self.e_hash1,
-                    self.e_hash2, self.authkey, self.e_nonce)
+        pixiecmd = (
+            f"pixiewps --pke {self.pke} --pkr {self.pkr} "
+            f"--e-hash1 {self.e_hash1} --e-hash2 {self.e_hash2} "
+            f"--authkey {self.authkey} --e-nonce {self.e_nonce}"
+        )
         if full_range:
             pixiecmd += ' --force'
         return pixiecmd
