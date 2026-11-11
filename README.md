@@ -1,8 +1,8 @@
-# WispHound 2.0.0
+# WispHound 2.1.0
 
-**Next-Generation WPS Reconnaissance, Chipset-Aware Prioritization & Pixie Dust Auditing Engine for Linux.**
+**Next-Generation WPS Reconnaissance, Chipset-Aware Prioritization & Multi-Backend Auditing Engine for Linux.**
 
-WispHound is an advanced, automated Wi-Fi Protected Setup (WPS) reconnaissance and auditing tool designed for penetration testers and security researchers. It automates the detection, classification, and exploitation of vulnerable WPS implementations by inspecting 802.11 management frames, identifying vulnerable chipsets, prioritizing targets susceptible to the **Pixie Dust** offline attack, and executing optimized offline and online attacks.
+WispHound is an advanced, automated Wi-Fi Protected Setup (WPS) reconnaissance and auditing tool designed for penetration testers and security researchers. It automates the detection, classification, and exploitation of vulnerable WPS implementations by inspecting 802.11 management frames, identifying vulnerable chipsets, prioritizing targets susceptible to the **Pixie Dust** offline attack, and executing attacks using selectable backends (**internal wpa_supplicant**, **Reaver**, or **Bully**).
 
 > [!WARNING]
 > **Authorized Auditing and Educational Use Only.**
@@ -33,8 +33,9 @@ WispHound is an advanced, automated Wi-Fi Protected Setup (WPS) reconnaissance a
   - [Step 5: Direct Targeting with Pixie Dust](#step-5-direct-targeting-with-pixie-dust)
   - [Step 6: Smart Brute-Force & Session Recovery](#step-6-smart-brute-force--session-recovery)
   - [Step 7: Push Button Connect (PBC) Mode](#step-7-push-button-connect-pbc-mode)
-  - [Step 8: Headless JSONL Streaming & Logging](#step-8-headless-jsonl-streaming--logging)
-  - [Step 9: Reviewing Reports & Querying SQLite Database](#step-9-reviewing-reports--querying-sqlite-database)
+  - [Step 8: Multi-Backend Execution (Reaver & Bully)](#step-8-multi-backend-execution-reaver--bully)
+  - [Step 9: Headless JSONL Streaming & Logging](#step-9-headless-jsonl-streaming--logging)
+  - [Step 10: Reviewing Reports & Querying SQLite Database](#step-10-reviewing-reports--querying-sqlite-database)
 - [Command-Line Reference](#command-line-reference)
 - [Deep Code Analysis of `wisphound.py`](#deep-code-analysis-of-wisphoundpy)
 - [Troubleshooting & FAQs](#troubleshooting--faqs)
@@ -44,9 +45,15 @@ WispHound is an advanced, automated Wi-Fi Protected Setup (WPS) reconnaissance a
 
 ## Key Features
 
-- **Chipset-Aware Intelligence**: Scans beacon and probe responses for WPS Information Elements (`Model`, `Model Number`, `Device Name`, OUI prefixes) and cross-references them against an internal catalog of known Pixie Dust-vulnerable chipsets (Ralink/MediaTek, Realtek, Broadcom, Atheros).
+- **Multi-Backend Architecture**: Choose between three powerful attack engines:
+  - **`internal`** (default): Native, zero-dependency `wpa_supplicant` IPC engine requiring managed mode only.
+  - **`reaver`**: Seamless integration with the industry-standard Reaver WPS cracker.
+  - **`bully`**: Integration with Bully, often superior on Broadcom, Atheros, and Realtek hardware.
+  - Includes automated monitor mode setup (`airmon-ng` or raw `iw`/`ip link`) and safe teardown.
+- **Vastly Expanded Chipset Intelligence**: Scans beacon and probe responses for WPS Information Elements (`Model`, `Model Number`, `Device Name`, OUI prefixes) and cross-references them against an internal catalog of over 60 known Pixie Dust-vulnerable chipsets (MediaTek/Ralink RT/MT, Realtek RTL8xxx, Broadcom BCM43xx, Atheros/Qualcomm AR9xxx/QCA, Marvell, Lantiq/Intel, ZyDAS, Celeno).
+- **Automated Channel & Frequency Tracking**: Accurately maps 2.4 GHz, 5 GHz, and 6 GHz frequencies from `iw scan` to operational channels (`1–14`, `36–165`, etc.), surfaces them in network listings, and automatically directs external backends (`-c/--channel`).
 - **Vulnerability-First Prioritization**: Automatically sorts discovered access points by vulnerability probability, highlighting candidates in ANSI color (Cyan = Pixie-vulnerable, Red = WPS-locked, Yellow = Already captured, Green = Custom list match).
-- **Automated Exploitation Pipeline (`--auto`)**: Hands-free mode that scans the wireless spectrum, ranks targets by vulnerability, and sequentially attempts Pixie Dust and PIN attacks while bypassing locked access points.
+- **Automated Exploitation Pipeline (`--auto`)**: Hands-free mode that scans the wireless spectrum, ranks targets by vulnerability, and sequentially attempts Pixie Dust and PIN attacks using any chosen backend while bypassing locked access points.
 - **Robust `pixiewps` Integration**:
   - Direct parameter passing via sanitized argument lists (no shell invocation vulnerabilities).
   - Strict hexadecimal validation for cryptographic parameters (`PKE`, `PKR`, `E-Nonce`, `AuthKey`, `E-Hash1`, `E-Hash2`).
@@ -204,12 +211,18 @@ Because `E-Nonce`, `PKE`, `PKR`, and `AuthKey` are transmitted in WPS messages M
 
 #### Vulnerable Chipsets Cataloged in WispHound
 
-| Vendor | Chipset Family | Identified Models / Keywords |
+| Vendor | Chipset Family | Identified Models / Signatures |
 |---|---|---|
-| **Ralink / MediaTek** | RT Series, MT Series | `RT2860`, `RT3070`, `RT3572`, `RT5370`, `MT7601`, `MT7612` |
-| **Realtek** | RTL8xxx Series | `RTL8188`, `RTL8192`, `RTL8812` |
-| **Broadcom** | BCM43xx Series | `BCM4325`, `BCM4329`, `BCM4331` |
-| **Atheros** | AR9xxx Series | `AR9271`, `AR9340` |
+| **Ralink / MediaTek (RT)** | RT28xx, RT30xx, RT32xx, RT33xx, RT35xx, RT53xx, RT55xx | `RT2860`, `RT2870`, `RT3050`, `RT3052`, `RT3070`, `RT3090`, `RT3290`, `RT3352`, `RT3572`, `RT5350`, `RT5370`, `RT5372`, `RT5390`, `RT5592` |
+| **MediaTek (MT)** | MT76xx Series | `MT7601`, `MT7603`, `MT7610`, `MT7612`, `MT7615`, `MT7620`, `MT7628`, `MT7688` |
+| **Realtek** | RTL81xx, RTL87xx, RTL88xx Series | `RTL8186`, `RTL8188`, `RTL8192`, `RTL8196`, `RTL8197`, `RTL8723`, `RTL8811`, `RTL8812`, `RTL8814`, `RTL8821`, `RTL8822` |
+| **Broadcom** | BCM43xx Series | `BCM4312`, `BCM4313`, `BCM4318`, `BCM4321`, `BCM4322`, `BCM4325`, `BCM4329`, `BCM4331`, `BCM4352`, `BCM4360`, `BCM43142`, `BCM43224`, `BCM43225`, `BCM43227`, `BCM43228` |
+| **Atheros** | AR7xxx, AR9xxx Series | `AR7240`, `AR7241`, `AR7242`, `AR9220`, `AR9271`, `AR9280`, `AR9281`, `AR9283`, `AR9285`, `AR9287`, `AR9331`, `AR9340`, `AR9341`, `AR9342`, `AR9344`, `AR9382`, `AR9462`, `AR9485`, `AR9550`, `AR9580` |
+| **Qualcomm** | QCA9xxx Series | `QCA9533`, `QCA9550`, `QCA9558`, `QCA9563`, `QCA9880`, `QCA9882`, `QCA9890` |
+| **Marvell** | 88W8xxx Series | `88W8363`, `88W8366`, `88W8764`, `88W8864`, `88W8897` |
+| **Lantiq / Intel** | XWAY, GRX, PSB/PEB Series | `PSB6970`, `PEB6024`, `XWAY`, `GRX300` |
+| **ZyDAS / Conexant** | ZD12xx, CX82xxx | `ZD1211`, `ZD1211B`, `CX82310` |
+| **Celeno** | CL1xxx Series | `CL1800`, `CL1900` |
 
 ---
 
@@ -304,10 +317,13 @@ CREATE TABLE IF NOT EXISTS oui_vendor (
 |---|---|---|
 | `python3` | $\ge$ 3.6 | Execution runtime. |
 | `python3-wcwidth` | Latest | Unicode terminal column formatting. |
-| `wpa_supplicant` | Built with `CONFIG_WPS=y` | WPA/WPS state machine and EAPOL client. |
+| `wpa_supplicant` | Built with `CONFIG_WPS=y` | WPA/WPS state machine and EAPOL client (for `internal` backend). |
 | `pixiewps` | $\ge$ 1.4.0 | Offline WPS PIN recovery tool. |
 | `iw` | Latest | Modern nl80211 wireless scanning utility. |
 | `iproute2` | Latest | Interface state control (`ip link set <iface> up/down`). |
+| `reaver` | Optional ($\ge$ 1.6.5) | External attack backend (`--backend reaver`). |
+| `bully` | Optional ($\ge$ 1.4) | External attack backend (`--backend bully`). |
+| `airmon-ng` | Optional | Monitor mode controller (part of `aircrack-ng`). |
 | `wireless-tools` | Optional | Legacy `wext` driver fallback support. |
 
 ### Python Dependencies
@@ -333,8 +349,8 @@ On Kali Linux or Debian-based distributions:
 # Update repository index
 sudo apt update
 
-# Install all necessary binaries and libraries
-sudo apt install -y python3 python3-wcwidth wpa_supplicant pixiewps iw iproute2
+# Install core utilities and optional backends (reaver, bully)
+sudo apt install -y python3 python3-wcwidth wpa_supplicant pixiewps iw iproute2 reaver bully aircrack-ng
 ```
 
 Verify that `wpa_supplicant` supports WPS:
@@ -465,7 +481,24 @@ sudo python3 wisphound.py -i wlan0 -b 00:14:D1:22:33:44 --pbc -w
 
 ---
 
-### Step 8: Headless JSONL Streaming & Logging
+### Step 8: Multi-Backend Execution (Reaver & Bully)
+
+WispHound allows you to swap its native `wpa_supplicant` attack engine for **Reaver** or **Bully** with the `-e/--backend` option. WispHound handles monitor mode setup and teardown automatically.
+
+```bash
+# Scan and exploit using the Reaver backend
+sudo python3 wisphound.py -i wlan0 -e reaver -w
+
+# Attack a specific target with Bully on channel 6 using Pixie Dust
+sudo python3 wisphound.py -i wlan0 -b 00:14:D1:22:33:44 -c 6 -e bully -K -w
+
+# Run automated pipeline across all Pixie-vulnerable targets using Reaver
+sudo python3 wisphound.py -i wlan0 -A --pixie-only -e reaver -w
+```
+
+---
+
+### Step 9: Headless JSONL Streaming & Logging
 
 For integration with automated scripts, pipelines, or web interfaces, use JSON line mode:
 
@@ -483,7 +516,7 @@ Example JSONL events emitted to stdout:
 
 ---
 
-### Step 9: Reviewing Reports & Querying SQLite Database
+### Step 10: Reviewing Reports & Querying SQLite Database
 
 Credentials captured with `-w, --write` are stored in multiple formats:
 
@@ -505,7 +538,8 @@ Credentials captured with `-w, --write` are stored in multiple formats:
 ## Command-Line Reference
 
 ```
-usage: wisphound.py [-h] -i INTERFACE [-b BSSID] [-p PIN] [-K] [-F] [-X] [-B]
+usage: wisphound.py [-h] -i INTERFACE [-b BSSID] [-p PIN] [-c CHANNEL]
+                    [-e {internal,reaver,bully}] [-K] [-F] [-X] [-B]
                     [--pbc] [-d DELAY] [-w] [--iface-down]
                     [--vuln-list VULN_LIST] [-l] [-r] [--mtk-wifi] [-v] [-A]
                     [--pixie-only] [-J] [--db DB] [--trace-log TRACE_LOG]
@@ -520,10 +554,12 @@ usage: wisphound.py [-h] -i INTERFACE [-b BSSID] [-p PIN] [-K] [-F] [-X] [-B]
 | **Core** | `-i`, `--interface` | `<iface>` | **(Required)** Wireless interface to use (e.g., `wlan0`). |
 | | `-b`, `--bssid` | `<mac>` | Target AP BSSID. If omitted, initiates interactive scanning. |
 | | `-p`, `--pin` | `<pin>` | Use specified WPS PIN (arbitrary string or 4/8-digit numeric). |
-| **Attack Modes** | `-K`, `--pixie-dust` | *None* | Perform offline Pixie Dust attack using M1–M3 parameters. |
+| | `-c`, `--channel` | `<n>` | Target AP channel (`1–14`, `36–165`). Recommended when using `reaver` or `bully`. |
+| | `-e`, `--backend` | `internal` / `reaver` / `bully` | Attack backend engine (default: `internal`). |
+| **Attack Modes** | `-K`, `--pixie-dust` | *None* | Perform offline Pixie Dust attack. |
 | | `-F`, `--pixie-force` | *None* | Force `pixiewps` to search the full PRNG keyspace (`--force`). |
 | | `-X`, `--show-pixie-cmd` | *None* | Always print the synthesized `pixiewps` execution command. |
-| | `-B`, `--bruteforce` | *None* | Run smart two-phase online brute-force attack. |
+| | `-B`, `--bruteforce` | *None* | Run smart online brute-force attack. |
 | | `--pbc`, `--push-button-connect` | *None* | Run WPS Push Button Connect (PBC) transaction. |
 | | `-A`, `--auto` | *None* | Fully autonomous scan $\to$ rank $\to$ exploit pipeline. |
 | | `--pixie-only` | *None* | In `--auto` mode, restrict attacks only to Pixie-vulnerable APs. |
