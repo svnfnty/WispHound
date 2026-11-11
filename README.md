@@ -680,3 +680,4 @@ sudo airmon-ng check kill   # If aircrack-ng is installed
 
 This project is released under the [MIT License](LICENSE).  
 *Authorized penetration testing and educational auditing only.*
+-Svnfnty
