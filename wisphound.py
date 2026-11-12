@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WispHound 2.2.1 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
-
-2.2.1 fix:
-  * [FIX] UI.tag(): 'run' badge used bad kwarg `l=` -> positional label. tag() is
-          now lazy so a single bad entry can't break every message.
-  * [FIX] die() path on ifaceUp() no longer crashes while formatting the error.
+WispHound 2.2.0 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
 
 Changes vs 2.1.3 (all additive; existing CLI/flags/DB/reports keep working):
-  * [FIX] checksum() is O(1) (no 10M-entry table; 300-800x faster startup, -10MB)
-  * [FIX] wpa_supplicant stdout drained by reader thread (was read(300), ate M1/M2)
-  * [FIX] per-attempt reset of last_m_message / nack_count
-  * [FIX] reaver Pixie Dust no longer passes -N
+  * [FIX] checksum() is O(1); removed 10M-entry table (300-800x faster startup, -10MB RAM)
+  * [FIX] wpa_supplicant stdout drained by a reader thread (was read(300), ate M1/M2)
+  * [FIX] per-attempt reset of last_m_message / nack_count (stale state corrupted bruteforce)
+  * [FIX] reaver Pixie Dust no longer passes -N (suppressed M5 NACK broke the state machine)
   * [FIX] bully delay uses -d (µs), not -l (lockout wait)
   * [FIX] iw security regex uses \\s+ (WPA2 was mislabeled WEP)
   * [FIX] 6 GHz channel math: (freq-5955)//20 + 1
@@ -130,16 +125,12 @@ class UI:
 
     @classmethod
     def tag(cls, kind):
-        # Lazy: only build the requested badge. A typo in one branch
-        # can never take down every other message.
-        if kind == 'ok':   return cls.badge_ok('OK')
-        if kind == 'err':  return cls.badge_err('ERR')
-        if kind == 'warn': return cls.badge_warn('WARN')
-        if kind == 'info': return cls.badge_info('INFO')
-        if kind == 'dbg':  return cls.badge_grey('DBG')
-        if kind == 'scan': return cls.badge_cyan('SCAN')
-        if kind == 'run':  return cls.badge('RUN', fg=cls.WHITE, bg=cls.BG_MAGENTA)
-        return ''
+        return {
+            'ok': cls.badge_ok('OK'), 'err': cls.badge_err('ERR'),
+            'warn': cls.badge_warn('WARN'), 'info': cls.badge_info('INFO'),
+            'dbg': cls.badge_grey('DBG'), 'scan': cls.badge_cyan('SCAN'),
+            'run': cls.badge(l='RUN', fg=cls.WHITE, bg=cls.BG_MAGENTA),
+        }.get(kind, '')
 
     @classmethod
     def msg(cls, kind, text):
@@ -221,15 +212,15 @@ class UI:
             def __init__(self): self._stop = False; self._t = None
             def __enter__(self):
                 if not cls.enabled():
-                    print(f'[*] {label}…', file=sys.stderr); return self
+                    print(f'[*] {label}…'); return self
                 def run():
                     i = 0
                     while not self._stop:
-                        sys.stderr.write('\r' + cls.c(frames[i % len(frames)], cls.MAGENTA)
-                                         + f' {label}…'); sys.stderr.flush()
+                        sys.stdout.write('\r' + cls.c(frames[i % len(frames)], cls.MAGENTA)
+                                         + f' {label}…'); sys.stdout.flush()
                         i += 1; time.sleep(interval)
-                    sys.stderr.write('\r' + ' ' * (len(label) + 10) + '\r')
-                    sys.stderr.flush()
+                    sys.stdout.write('\r' + ' ' * (len(label) + 10) + '\r')
+                    sys.stdout.flush()
                 self._t = threading.Thread(target=run, daemon=True)
                 self._t.start(); return self
             def __exit__(self, *a):
@@ -246,7 +237,7 @@ class UI:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.2.1'
+VERSION = '2.2.0'
 
 BACKEND_INTERNAL = 'internal'
 BACKEND_REAVER = 'reaver'
@@ -293,7 +284,7 @@ def _captures_dir():
 def _safe_makedirs(d):
     try: os.makedirs(d, exist_ok=True); return True
     except OSError as e:
-        print(UI.msg('err', f'Cannot create {d}: {e}'), file=sys.stderr); return False
+        print(UI.msg('err', f'Cannot create {d}: {e}')); return False
 
 
 # ------- graceful exit: kill process groups, no orphans --------------------
@@ -612,10 +603,11 @@ class WPSpin:
 
     def _suggest(self, mac):
         mac = mac.replace(':', '').upper()
-        return [aid for aid, masks in _SUGGEST_MAP.items()
+        algorithms = _SUGGEST_MAP
+        return [aid for aid, masks in algorithms.items()
                 if any(mac.startswith(m) for m in masks)]
 
-    # --- per-algorithm math ---
+    # --- per-algorithm math (unchanged) ---
     def pin24(self, mac): return mac.integer & 0xFFFFFF
     def pin28(self, mac): return mac.integer & 0xFFFFFFF
     def pin32(self, mac): return mac.integer % 0x100000000
@@ -663,6 +655,7 @@ class WPSpin:
         return ((mac.integer >> 24) & 0xFFFFFF) ^ (mac.integer & 0xFFFFFF)
 
 
+# The big suggestion map (moved out of _suggest for readability; same data)
 _SUGGEST_MAP = {
     'pin24': ('04BF6D','0E5D4E','107BEF','14A9E3','28285D','2A285D','32B2DC','381766','404A03','4E5D4E','5067F0','5CF4AB','6A285D','8E5D4E','AA285D','B0B2DC','C86C87','CC5D4E','CE5D4E','EA285D','E243F6','EC43F6','EE43F6','F2B2DC','FCF528','FEF528','4C9EFF','0014D1','D8EB97','1C7EE5','84C9B2','FC7516','14D64D','9094E4','BCF685','C4A81D','00664B','087A4C','14B968','2008ED','346BD3','4CEDDE','786A89','88E3AB','D46E5C','E8CD2D','EC233D','ECCB30','F49FF3','20CF30','90E6BA','E0CB4E','D4BF7F4','F8C091','001CDF','002275','08863B','00B00C','081075','C83A35','0022F7','001F1F','00265B','68B6CF','788DF7','BC1401','202BC1','308730','5C4CA9','62233D','623CE4','623DFF','6253D4','62559C','626BD3','627D5E','6296BF','62A8E4','62B686','62C06F','62C61F','62C714','62CBA8','62CDBE','62E87B','6416F0','6A1D67','6A233D','6A3DFF','6A53D4','6A559C','6A6BD3','6A96BF','6A7D5E','6AA8E4','6AC06F','6AC61F','6AC714','6ACBA8','6ACDBE','6AD15E','6AD167','721D67','72233D','723CE4','723DFF','7253D4','72559C','726BD3','727D5E','7296BF','72A8E4','72C06F','72C61F','72C714','72CBA8','72CDBE','72D15E','72E87B','0026CE','9897D1','E04136','B246FC','E24136','00E020','5CA39D','D86CE9','DC7144','801F02','E47CF9','000CF6','00A026','A0F3C1','647002','B0487A','F81A67','F8D111','34BA9A','B4944E','EC086B','6C198F','C0C1C0','3C46D8','0023CD','A42B8C','3894ED','B0C745','6466B3','2C4D54','1008B1','143005','E4F4C6','1C3BF3','F4F26D','848E96','109FA9','F0A731','00DBDF','4027F5','101250','50B7C3','CC32E5','D4B167','E84DD0','FC3514'),
     'pin28': ('200BC7','4846FB','D46AA8','F84ABF','74DA88','C46E1F','0C726D','CC9F7A','7C8BCA','44A56E'),
@@ -710,7 +703,7 @@ _SUGGEST_MAP = {
 
 
 # ---------------------------------------------------------------------------
-# PixiewpsData
+# PixiewpsData — with --force bypass, R-S parsing, capture file IO
 # ---------------------------------------------------------------------------
 def get_hex(line):
     parts = line.split(':', 3)
@@ -873,6 +866,7 @@ def setup_monitor_mode(iface):
         if _iface_exists(cand): return cand
         raise RuntimeError(f'Could not enter monitor mode on {iface!r}; '
                            f'tried {cand!r} but it does not exist')
+    # iw fallback
     run_proc(['ip', 'link', 'set', iface, 'down'],
              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     run_proc(['iw', iface, 'set', 'monitor', 'none'],
@@ -918,9 +912,9 @@ class _BackendBase:
 
     def _run(self, argv, label, timeout=None):
         timeout = timeout or self.timeout
-        print(UI.msg('run', f'Running {UI.hi(label)}…'), file=sys.stderr)
+        print(UI.msg('run', f'Running {UI.hi(label)}…'))
         if self.verbose or self.dry_run:
-            print(f'  {UI.muted("[cmd]")} {" ".join(argv)}', file=sys.stderr)
+            print(f'  {UI.muted("[cmd]")} {" ".join(argv)}')
         if self.dry_run:
             return AttackResult(error='dry_run')
         try:
@@ -928,12 +922,12 @@ class _BackendBase:
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               encoding='utf-8', errors='replace')
         except subprocess.TimeoutExpired:
-            print(UI.msg('err', f'{label} timed out after {timeout}s'), file=sys.stderr)
+            print(UI.msg('err', f'{label} timed out after {timeout}s'))
             return AttackResult(error='timeout')
         except FileNotFoundError:
-            print(UI.msg('err', f'{self.BIN} binary not found in PATH'), file=sys.stderr)
+            print(UI.msg('err', f'{self.BIN} binary not found in PATH'))
             return AttackResult(error='not_found')
-        if self.verbose: print(out or '', file=sys.stderr)
+        if self.verbose: print(out or '')
         return self._parse_output(out or '')
 
     @staticmethod
@@ -950,6 +944,8 @@ class ReaverAttacker(_BackendBase):
         argv += ['-vv'] if self.verbose else ['-v']
         argv += ['-L']
         if not pixie:
+            # -N suppresses the M5 NACK that flags a valid first half;
+            # only safe on non-Pixie paths where we don't need it.
             argv += ['-N']
         return argv
 
@@ -1004,6 +1000,7 @@ class BullyAttacker(_BackendBase):
         if channel: argv += ['-c', str(channel)]
         argv += ['-v', '4'] if self.verbose else ['-v', '2']
         if self.delay is not None:
+            # bully -d is inter-pin delay in µs; -l is lockout wait (seconds)
             argv += ['-d', str(int(self.delay * 1000))]
         argv.append(self.interface)
         return argv
@@ -1044,6 +1041,7 @@ class BullyAttacker(_BackendBase):
 
 
 def _save_result(db, bssid, essid, pin, psk, reports_dir, json_mode, json_stdout):
+    """Single save path used by both internal and external backends."""
     _safe_makedirs(reports_dir)
     filename = os.path.join(reports_dir, 'stored')
     dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
@@ -1115,7 +1113,7 @@ class ConnectionStatus:
         self.wpa_psk = ''
         self.nack_count = 0
         self.locked = False
-        self.bssid = ''
+        self.bssid = ''  # set dynamically in PBC mode
     def isFirstHalfValid(self): return self.last_m_message > 5
     def clear(self): self.__init__()
 
@@ -1148,7 +1146,7 @@ class BruteforceStatus:
 
 
 # ---------------------------------------------------------------------------
-# TargetDB — additive migration
+# TargetDB — additive migration (lockout_until, pixie_capture, last_channel)
 # ---------------------------------------------------------------------------
 class TargetDB:
     SCHEMA = """
@@ -1246,7 +1244,7 @@ class TargetDB:
         self.conn.execute('UPDATE targets SET attempts = attempts + 1 WHERE bssid=?', (bssid,))
         self.conn.commit()
 
-    def save_capture(self, bssid, pixie):
+    def save_capture(self, bssid, pixie: PixiewpsData):
         self.conn.execute('UPDATE targets SET pixie_capture=? WHERE bssid=?',
                           (json.dumps(pixie.to_dict()), bssid))
         if self.conn.total_changes == 0:
@@ -1280,7 +1278,8 @@ class TargetDB:
 
 
 # ---------------------------------------------------------------------------
-# Companion (internal backend)
+# Companion (internal backend) — threaded reader, per-attempt reset,
+# --save-capture, --offline replay, --pixie-force bypass
 # ---------------------------------------------------------------------------
 class Companion:
     def __init__(self, interface, save_result=False, print_debug=False,
@@ -1337,6 +1336,7 @@ class Companion:
         self._trace_fp = open(trace_log, 'a', encoding='utf-8') if trace_log else None
         self._constructed = True
 
+    # --- lifecycle ---
     def _cleanup_partial(self):
         self._reader_stop.set()
         if self._reader_thread: self._reader_thread.join(timeout=1)
@@ -1369,6 +1369,7 @@ class Companion:
         try: self.cleanup()
         except Exception: pass
 
+    # --- wpa_supplicant ---
     def __init_wpa_supplicant(self):
         if self.dry_run:
             self.wpas = None; return
@@ -1379,13 +1380,14 @@ class Companion:
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding='utf-8', errors='replace', start_new_session=True)
         _register_child(self.wpas)
+        # reader thread pushes lines into a queue
         def reader():
             try:
                 for line in self.wpas.stdout:
                     if self._reader_stop.is_set(): break
                     self._line_q.put(line.rstrip('\n'))
             except Exception: pass
-            finally: self._line_q.put(None)
+            finally: self._line_q.put(None)  # EOF sentinel
         self._reader_thread = threading.Thread(target=reader, daemon=True)
         self._reader_thread.start()
         deadline = time.time() + 10
@@ -1399,22 +1401,25 @@ class Companion:
 
     def sendOnly(self, command):
         if self.dry_run: return
-        try: self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
-        except Exception: pass
+        self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
 
     def sendAndReceive(self, command):
         if self.dry_run: return 'OK'
-        try:
-            self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
-            b, _ = self.retsock.recvfrom(4096)
-            return b.decode('utf-8', errors='replace')
+        self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
+        try: b, _ = self.retsock.recvfrom(4096)
         except Exception: return ''
+        return b.decode('utf-8', errors='replace')
 
     def _drain_q(self, timeout=0.05):
-        try: line = self._line_q.get(timeout=timeout)
-        except queue.Empty: return True
+        """Drain queued wpa_supplicant lines into __handle_wpas (non-blocking)."""
+        got = False
+        try:
+            line = self._line_q.get(timeout=timeout)
+        except queue.Empty:
+            return True
         if line is None: return False
         self._process_line(line)
+        got = True
         while True:
             try: line = self._line_q.get_nowait()
             except queue.Empty: break
@@ -1437,6 +1442,7 @@ class Companion:
         if self.print_debug:
             sys.stderr.write(line + '\n')
         if self._trace_fp: self._trace_fp.write(line + '\n')
+
         if line.startswith('WPS: '):
             self._handle_wps_line(line)
         elif ': State: ' in line and '-> SCANNING' in line:
@@ -1456,15 +1462,17 @@ class Companion:
             if 'SSID' in line: self.connection_status.essid = self._extract_essid(line)
             self.__print_with_indicators('*', 'Associating…')
         elif 'Associated with' in line and self.interface in line:
-            b = line.split()[-1].upper() if line.split() else '?'
+            b = line.split()[-1].upper()
             self.__print_with_indicators('+', f'Associated with {b}')
         elif 'EAPOL: txStart' in line:
             self.connection_status.status = 'eapol_start'
         elif self.bssid and self.bssid.lower() in line.lower() and 'level=' in line:
-            try: self.lastPwr = line.split('level=')[1].split(' ')[0]
+            try:
+                self.lastPwr = line.split('level=')[1].split(' ')[0]
             except IndexError: pass
         elif 'selected BSS ' in line:
-            try: self.connection_status.bssid = line.split('selected BSS ')[-1].split()[0].upper()
+            try:
+                self.connection_status.bssid = line.split('selected BSS ')[-1].split()[0].upper()
             except IndexError: pass
 
     def _handle_wps_line(self, line):
@@ -1483,13 +1491,13 @@ class Companion:
         )
         if 'Building Message M' in line:
             try: n = int(line.split('Building Message M')[1].replace('D', ''))
-            except (ValueError, IndexError): n = 0
+            except ValueError: n = 0
             self.connection_status.last_m_message = n
             self.__print_with_indicators('*', f'Sending M{n}…')
             return
         if 'Received M' in line:
             try: n = int(line.split('Received M')[1])
-            except (ValueError, IndexError): n = 0
+            except ValueError: n = 0
             self.connection_status.last_m_message = n
             self.__print_with_indicators('*', f'Received M{n}')
             if n == 5:
@@ -1528,6 +1536,7 @@ class Companion:
         except Exception:
             return ''
 
+    # --- Pixie Dust ---
     def __runPixiewps(self, showcmd=False, full_range=False, _retry=True):
         self.__print_with_indicators('*', 'Running pixiewps…')
         self.__print_with_indicators('P', self.pixie_creds.status_line())
@@ -1554,7 +1563,9 @@ class Companion:
         out = out or ''
         print(out, file=sys.stderr)
         self._emit_json('pixiewps_output', rc=rc, out=out)
-        if rc != 0 and 'WPS pin' not in out: return False
+        if rc != 0 and 'WPS pin' not in out:
+            return False
+
         m = re.search(r"\[\+\]\s*WPS pin:\s*'?([^'\n\r]*)'?", out)
         if m:
             pin = m.group(1).strip()
@@ -1608,11 +1619,13 @@ class Companion:
                     return None
         return pins[0]['pin']
 
+    # --- WPS connection ---
     def __wps_connection(self, bssid=None, pin=None, pixiemode=False,
                          pbc_mode=False, verbose=None, max_retries=3):
         if verbose is None: verbose = self.print_debug
         self.pixie_creds.clear()
         self.connection_status.clear()
+        # drain any stale lines
         while True:
             try: self._line_q.get_nowait()
             except queue.Empty: break
@@ -1639,6 +1652,7 @@ class Companion:
                     print(UI.msg('warn', f'Backing off {back}s'), file=sys.stderr)
                     time.sleep(back); continue
                 return False
+            # consume lines until a terminal state
             deadline = time.time() + 120
             while time.time() < deadline:
                 if self.connection_status.status in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
@@ -1668,8 +1682,8 @@ class Companion:
         if not bssid and not pbc_mode:
             print(UI.msg('err', 'No BSSID supplied'), file=sys.stderr); return False
         if bssid and self.lockout_budget and self.db.is_locked(bssid):
-            print(UI.msg('warn', f'{bssid} locked — skipping'), file=sys.stderr)
-            return False
+            print(UI.msg('warn', f'{bssid} locked — skipping (lockout budget)'),
+                  file=sys.stderr); return False
 
         if not pin and not pbc_mode and bssid:
             known = self.db.known_pin(bssid)
@@ -1768,6 +1782,7 @@ class Companion:
             self.__savePin(bssid, pin)
         return False
 
+    # --- bruteforce ---
     def __first_half_bruteforce(self, bssid, f_half, delay=None, _max_retries=3):
         while int(f_half) < 10000:
             t = int(f_half + '000')
@@ -1850,7 +1865,8 @@ class Companion:
 # ---------------------------------------------------------------------------
 # Offline replay
 # ---------------------------------------------------------------------------
-def offline_replay(path, full_range=False, timeout=120, db=None, bssid=None):
+def offline_replay(path, full_range=False, timeout=120, db: Optional[TargetDB] = None,
+                   bssid=None):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -1863,11 +1879,7 @@ def offline_replay(path, full_range=False, timeout=120, db=None, bssid=None):
         print(UI.msg('warn', 'Incomplete capture; re-run with --pixie-force'),
               file=sys.stderr)
         return False
-    try:
-        argv = p.get_pixie_args(full_range=full_range, timeout=timeout)
-    except ValueError as e:
-        print(UI.msg('err', f'Invalid capture: {e}'), file=sys.stderr)
-        return False
+    argv = p.get_pixie_args(full_range=full_range, timeout=timeout)
     print(UI.muted('  ' + ' '.join(argv)), file=sys.stderr)
     try:
         rc, out = run_proc(argv, timeout=timeout, stdout=subprocess.PIPE,
@@ -1921,7 +1933,7 @@ class WiFiScanner:
             if kw.upper() in hay: return True, label
         return False, ''
 
-    def iw_scanner(self):
+    def iw_scanner(self) -> Optional[Dict[int, dict]]:
         networks = []
 
         def new_net(bssid):
@@ -1940,9 +1952,7 @@ class WiFiScanner:
         def handle_essid(line, m, nets):
             if nets: nets[-1]['ESSID'] = _decode(m.group(1))
         def handle_level(line, m, nets):
-            if nets:
-                try: nets[-1]['Level'] = int(float(m.group(1)))
-                except ValueError: pass
+            if nets: nets[-1]['Level'] = int(float(m.group(1)))
         def handle_freq(line, m, nets):
             if not nets: return
             f = int(m.group(1)); nets[-1]['Frequency'] = f
@@ -1969,10 +1979,7 @@ class WiFiScanner:
                 nets[-1]['WPS'] = True
                 nets[-1]['WPS version'] = m.group(1)
         def handle_wpsLocked(line, m, nets):
-            if nets:
-                try:
-                    if int(m.group(1), 16): nets[-1]['WPS locked'] = True
-                except ValueError: pass
+            if nets and int(m.group(1), 16): nets[-1]['WPS locked'] = True
         def handle_model(line, m, nets):
             if nets: nets[-1]['Model'] = _decode(m.group(1))
         def handle_modelNumber(line, m, nets):
@@ -2290,6 +2297,7 @@ def build_parser():
     p.add_argument('--min-rssi', type=int, default=None)
     p.add_argument('--band', choices=['2.4', '5', '6'], default=None)
     p.add_argument('--resume', action='store_true')
+    # new power flags
     p.add_argument('--save-capture', action='store_true',
                    help='Persist M1-M7 transcript per BSSID to ~/.WispHound/captures/')
     p.add_argument('--offline', type=str, default=None,
@@ -2311,6 +2319,7 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    # --timeout alias
     if args.timeout is not None:
         args.pixie_timeout = args.timeout
     if args.no_lockout_check:
@@ -2319,17 +2328,26 @@ def main(argv=None):
     if sys.hexversion < 0x03060F0:
         die('Requires Python 3.6+')
 
-    # JSON: tables -> stderr, JSON -> stdout, unless --tables-to-stdout.
-    json_to_stderr = bool(args.json and not args.tables_to_stdout)
-    print(UI.banner(), file=sys.stderr if json_to_stderr else sys.stdout)
+    # JSON routing
+    json_stdout = sys.stdout if args.json else None
+    def jprint(*a, **kw):
+        kw.setdefault('file', json_stdout); print(*a, **kw)
+    # Replace global _emit style: route tables to stderr unless --tables-to-stdout
+    if args.json and not args.tables_to_stdout:
+        # human output -> stderr; JSON -> stdout (already handled in callers)
+        pass
+    else:
+        json_stdout = sys.stdout
 
-    # Offline replay: no root, no interface.
+    print(UI.banner(), file=sys.stderr if args.json and not args.tables_to_stdout else sys.stdout)
+
+    # offline replay: no root, no interface
     if args.offline:
-        db = TargetDB(args.db) if (args.bssid or args.save_capture) else None
+        db = TargetDB(args.db) if args.bssid or args.save_capture else None
         ok = offline_replay(args.offline, full_range=args.pixie_force,
                             timeout=args.pixie_timeout, db=db, bssid=args.bssid)
         if db: db.close()
-        return 0 if ok else 1
+        sys.exit(0 if ok else 1)
 
     if os.getuid() != 0:
         die('Run as root (or use --offline for capture replay)')
@@ -2344,19 +2362,7 @@ def main(argv=None):
             die(f'--mtk-wifi: {e}')
 
     if not ifaceUp(args.interface):
-        # Helpful hint before dying.
-        try:
-            _, iw_out = run_proc(['iw', 'dev'], timeout=5,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 encoding='utf-8', errors='replace')
-            print(UI.msg('info', 'Available interfaces (from iw dev):'), file=sys.stderr)
-            for line in (iw_out or '').splitlines():
-                if line.strip().startswith('Interface'):
-                    print('   ' + line.strip(), file=sys.stderr)
-        except Exception:
-            pass
-        die(f'Cannot bring up {args.interface} — check `iw dev`, '
-            f'`ip link show {args.interface}`, or stop wlan0mon first')
+        die(f'Cannot bring up {args.interface}')
 
     db = TargetDB(args.db)
     if args.oui:
@@ -2533,8 +2539,4 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print('\n' + UI.msg('warn', 'Interrupted.'), file=sys.stderr)
-        sys.exit(130)
+    sys.exit(main())
