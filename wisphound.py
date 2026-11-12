@@ -14,6 +14,9 @@ Major changes vs 2.0.0:
     resolution during scans, surfaced in tables and passed to reaver/bully (-c/--channel).
   * Monitor Mode Management: Automatic setup and teardown for reaver and bully
     using airmon-ng or native iw/ip link.
+
+# [MOD] 2.1.1 — Full-band scan: every visible AP is listed (2.4/5/6 GHz),
+#              WPS status is annotated instead of filtering non-WPS out.
 """
 import argparse
 import codecs
@@ -50,7 +53,7 @@ except ImportError:                                    # graceful degrade
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.1.0'
+VERSION = '2.1.1'                                      # [MOD] bumped
 
 def _graceful_exit_handler(signum, frame):
     raise KeyboardInterrupt
@@ -2181,6 +2184,7 @@ class WiFiScanner:
         self.selected_vuln = False
         self.selected_chipset = ''
         self.selected_channel = 0
+        self.selected_wps = False                          # [MOD]
 
         self.stored = []
         reports = os.path.join(
@@ -2289,10 +2293,20 @@ class WiFiScanner:
             else:
                 networks[-1]['Channel'] = 0
 
-        proc = subprocess.run(['iw', 'dev', self.interface, 'scan'],
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT,
-                              encoding='utf-8', errors='replace')
+        # [MOD] Optional: honor --band flag on the scan request itself.
+        # Some drivers only return 2.4 GHz on plain `iw scan` unless -u is set.
+        argv = ['iw', 'dev', self.interface, 'scan']
+        if self.band is None or self.band in ('5', '6'):
+            argv.append('--all')
+        try:
+            proc = subprocess.run(argv,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  encoding='utf-8', errors='replace')
+        except FileNotFoundError:
+            print('[!] iw not found — install wireless-tools / iw')
+            return False
+
         lines = proc.stdout.splitlines()
         networks = []
         matchers = {
@@ -2320,29 +2334,40 @@ class WiFiScanner:
                 if m:
                     handler(line, m, networks)
 
-        networks = [n for n in networks if n['WPS']]
+        # [MOD] Do NOT drop non-WPS networks — annotate them instead.
+        # Original line was: networks = [n for n in networks if n['WPS']]
+
         if self.min_rssi is not None:
-            networks = [n for n in networks if n.get('Level', -100) >= self.min_rssi]
+            networks = [n for n in networks
+                        if n.get('Level', -100) >= self.min_rssi]
         if self.band:
             if self.band == '2.4':
-                networks = [n for n in networks if 2400 <= n.get('Frequency', 0) <= 2500]
+                networks = [n for n in networks
+                            if 2400 <= n.get('Frequency', 0) <= 2500]
             elif self.band == '5':
-                networks = [n for n in networks if 5000 <= n.get('Frequency', 0) <= 5900]
+                networks = [n for n in networks
+                            if 5000 <= n.get('Frequency', 0) <= 5900]
             elif self.band == '6':
-                networks = [n for n in networks if 5900 <= n.get('Frequency', 0) <= 7200]
+                networks = [n for n in networks
+                            if 5900 <= n.get('Frequency', 0) <= 7200]
         if not networks:
             return False
 
         for net in networks:
             vuln, chipset = self._classify_pixie_vuln(net)
-            net['Pixie vulnerable'] = vuln
+            # Pixie vulnerability only meaningful on WPS-capable APs
+            net['Pixie vulnerable'] = vuln and bool(net.get('WPS'))
             net['Chipset'] = chipset
             if self.db:
                 net['Vendor'] = self.db.vendor_for(net['BSSID'])
                 self.db.upsert(net)
 
-        networks.sort(key=lambda x: (not x['Pixie vulnerable'],
-                                     x['WPS locked'], -x['Level']))
+        # [MOD] Sort: WPS & Pixie-vulnerable & unlocked & strong signal first;
+        #       non-WPS pushed to bottom but still listed.
+        networks.sort(key=lambda x: (not x['WPS'],
+                                     not x['Pixie vulnerable'],
+                                     x['WPS locked'],
+                                     -x['Level']))
         network_list = {(i + 1): n for i, n in enumerate(networks)}
 
         # ---- printing ----
@@ -2366,21 +2391,22 @@ class WiFiScanner:
 
         def colored(text, color=None):
             codes = {'green': '\033[92m', 'red': '\033[91m',
-                     'yellow': '\033[93m', 'cyan': '\033[96m'}
+                     'yellow': '\033[93m', 'cyan': '\033[96m',
+                     'grey': '\033[90m'}                # [MOD]
             if color in codes:
                 return f'{codes[color]}{text}\033[00m'
             return text
 
-        if self.vuln_list:
-            print('Network marks: {1} {0} {2} {0} {3} {0} {4}'.format(
-                '|',
-                colored('Possibly vulnerable', 'green'),
-                colored('WPS locked', 'red'),
-                colored('Already stored', 'yellow'),
-                colored('Pixie-vulnerable', 'cyan')))
-        print('Networks list:')
-        print('{:<4} {:<18} {:<25} {:<8} {:<4} {:<4} {:<27} {:<}'.format(
-            '#', 'BSSID', 'ESSID', 'Sec.', 'PWR', 'Ch',
+        print('Network marks: {1} {0} {2} {0} {3} {0} {4} {0} {5}'.format(
+            '|',
+            colored('Possibly vulnerable', 'green'),
+            colored('WPS locked', 'red'),
+            colored('Already stored', 'yellow'),
+            colored('Pixie-vulnerable', 'cyan'),
+            colored('No WPS', 'grey')))                     # [MOD]
+        print('Networks list (all bands):')                     # [MOD]
+        print('{:<4} {:<18} {:<25} {:<8} {:<4} {:<4} {:<5} {:<27} {:<}'.format(
+            '#', 'BSSID', 'ESSID', 'Sec.', 'PWR', 'Ch', 'WPS',  # [MOD] WPS column
             'WSC device name', 'WSC model'))
 
         items = list(network_list.items())
@@ -2391,6 +2417,7 @@ class WiFiScanner:
             essid = truncateStr(net.get('ESSID', 'HIDDEN'), 25)
             dev = truncateStr(net['Device name'], 27)
             ch = str(net.get('Channel', ''))
+            wps_flag = 'yes' if net.get('WPS') else 'no'          # [MOD]
             line = ' '.join([
                 truncateStr(f'{n})', 4),
                 truncateStr(net['BSSID'], 18),
@@ -2398,10 +2425,13 @@ class WiFiScanner:
                 truncateStr(net['Security type'], 8),
                 truncateStr(str(net['Level']), 4),
                 truncateStr(ch, 4),
+                truncateStr(wps_flag, 5),                         # [MOD]
                 dev,
                 model,
             ])
-            if net.get('Pixie vulnerable'):
+            if not net.get('WPS'):                                # [MOD] non-WPS first
+                print(colored(line, 'grey'))
+            elif net.get('Pixie vulnerable'):
                 print(colored(line, 'cyan'))
             elif (net['BSSID'], net.get('ESSID', 'HIDDEN')) in self.stored:
                 print(colored(line, 'yellow'))
@@ -2417,7 +2447,7 @@ class WiFiScanner:
     def prompt_network(self):
         networks = self.iw_scanner()
         if not networks:
-            print('[-] No WPS networks found.')
+            print('[-] No networks found.')
             return None
         while True:
             try:
@@ -2427,9 +2457,18 @@ class WiFiScanner:
                 idx = int(choice)
                 if idx in networks:
                     target = networks[idx]
+                    # [MOD] Warn but allow selection of non-WPS APs
+                    if not target.get('WPS'):
+                        print(f"[!] {target['BSSID']} does not advertise WPS.")
+                        print("    WispHound attacks require WPS — reaver/bully/"
+                              "wpa_supplicant cannot target this AP.")
+                        ans = input('    Select anyway? [y/N] ').strip().lower()
+                        if ans != 'y':
+                            continue
                     self.selected_vuln = target.get('Pixie vulnerable', False)
                     self.selected_chipset = target.get('Chipset', '')
                     self.selected_channel = target.get('Channel', 0)
+                    self.selected_wps = bool(target.get('WPS'))
                     return target['BSSID']
                 raise IndexError
             except (ValueError, IndexError):
@@ -2446,10 +2485,11 @@ def auto_exploit(interface, args, db):
         band=getattr(args, 'band', None))
     networks = scanner.iw_scanner()
     if not networks:
-        print('[-] No WPS networks.')
+        print('[-] No networks.')
         return
     order = sorted(networks.values(),
-                   key=lambda n: (not n['Pixie vulnerable'],
+                   key=lambda n: (not n['WPS'],                 # [MOD]
+                                  not n['Pixie vulnerable'],
                                   n['WPS locked'], -n['Level']))
 
     backend = getattr(args, 'backend', BACKEND_INTERNAL)
@@ -2473,6 +2513,9 @@ def auto_exploit(interface, args, db):
                 json_mode=args.json)
 
             for net in order:
+                if not net.get('WPS'):                       # [MOD] skip non-WPS
+                    print(f"[i] Skipping {net['BSSID']} (no WPS)")
+                    continue
                 if net['WPS locked']:
                     print(f"[i] Skipping {net['BSSID']} (WPS locked)")
                     continue
@@ -2507,6 +2550,9 @@ def auto_exploit(interface, args, db):
 
     # ------- Internal backend (wpa_supplicant) -----------------------------
     for net in order:
+        if not net.get('WPS'):                               # [MOD] skip non-WPS
+            print(f"[i] Skipping {net['BSSID']} (no WPS)")
+            continue
         if net['WPS locked']:
             print(f"[i] Skipping {net['BSSID']} (WPS locked)")
             continue
@@ -2715,6 +2761,7 @@ if __name__ == '__main__':
                 selected_vuln = False
                 selected_chipset = ''
                 selected_channel = args.channel
+                selected_wps = True                            # [MOD]
 
                 if args.pbc:
                     reports_dir = os.path.join(
@@ -2768,12 +2815,22 @@ if __name__ == '__main__':
                         args.bssid = scanner.prompt_network()
                         selected_vuln = scanner.selected_vuln
                         selected_chipset = scanner.selected_chipset
+                        selected_wps = scanner.selected_wps  # [MOD]
                         if not selected_channel:
                             selected_channel = scanner.selected_channel
 
                     if not args.bssid:
                         if not args.loop:
                             break
+                        continue
+
+                    # [MOD] Defensive check — block attacks on non-WPS AP
+                    if not selected_wps:
+                        print(f"[!] {args.bssid} has no WPS — cannot attack with "
+                              f"{args.backend} backend. Choose another target.")
+                        if not args.loop:
+                            break
+                        args.bssid = None
                         continue
 
                     reports_dir = os.path.join(
