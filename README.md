@@ -1,4 +1,4 @@
-# WispHound 2.1.0
+# WispHound 2.1.3
 
 **Next-Generation WPS Reconnaissance, Chipset-Aware Prioritization & Multi-Backend Auditing Engine for Linux.**
 
