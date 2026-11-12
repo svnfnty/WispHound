@@ -3,7 +3,9 @@
 """
 WispHound GUI 2.1.2 — Tkinter frontend for the WispHound engine.
 
-Requires the original wisphound.py module in the same directory.
+Requires the original WispHound script (wisphound.py or wisphound.txt) in
+the same directory.
+
 Run as root:  sudo python3 wisphound_gui.py
 """
 import os
@@ -13,7 +15,24 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog
+
+# ==========================================================================
+# SQLite cross-thread fix
+# --------------------------------------------------------------------------
+# The engine opens its TargetDB connection on the Tk main thread, but
+# WiFiScanner / Companion call it from worker threads. sqlite3's default
+# check_same_thread=True rejects that. We patch sqlite3.connect() to default
+# check_same_thread=False globally, before the engine creates any DB object.
+# This is safe here because the GUI serialises operations (only one worker
+# touches the DB at a time via self.busy).
+# ==========================================================================
+import sqlite3 as _sqlite
+_orig_sqlite_connect = _sqlite.connect
+def _patched_sqlite_connect(*a, **kw):
+    kw.setdefault("check_same_thread", False)
+    return _orig_sqlite_connect(*a, **kw)
+_sqlite.connect = _patched_sqlite_connect
 
 # --------------------------------------------------------------------------
 # Import the engine. The original file has a `if __name__ == '__main__'`
@@ -22,8 +41,8 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 try:
     import wisphound as engine  # rename your script to wisphound.py
 except ImportError:
-    # Fallback: load by path (rename not required)
-    import importlib.util, pathlib
+    import importlib.util
+    import pathlib
     for cand in ("wisphound.py", "wisphound.txt"):
         p = pathlib.Path(__file__).with_name(cand)
         if p.exists():
@@ -33,7 +52,9 @@ except ImportError:
             spec.loader.exec_module(engine)
             break
     else:
-        raise SystemExit("Place wisphound.py (or .txt) next to this GUI file.")
+        raise SystemExit(
+            "Place wisphound.py (or .txt) next to this GUI file."
+        )
 
 
 # ==========================================================================
@@ -51,7 +72,7 @@ WARN      = "#f59e0b"
 ERR       = "#ef4444"
 BORDER    = "#2a3038"
 
-MONO = ("Consolas", 10) if sys.platform.startswith("win") else ("Monospace", 10)
+MONO    = ("Consolas", 10) if sys.platform.startswith("win") else ("Monospace", 10)
 UI_FONT = ("Segoe UI", 10) if sys.platform.startswith("win") else ("Helvetica", 10)
 
 
@@ -144,7 +165,6 @@ class LogPane(tk.Frame):
     def write(self, msg, tag="info"):
         self.q.put((msg, tag))
 
-    # thread-safe entry point
     def _drain(self):
         try:
             while True:
@@ -152,7 +172,10 @@ class LogPane(tk.Frame):
                 self._append(msg, tag)
         except queue.Empty:
             pass
-        self.after(60, self._drain)
+        try:
+            self.after(60, self._drain)
+        except tk.TclError:
+            pass
 
     def _append(self, msg, tag):
         self.text.configure(state="normal")
@@ -161,7 +184,6 @@ class LogPane(tk.Frame):
         self.text.insert("end", str(msg).rstrip("\n") + "\n",
                          tag if tag in self.TAGS else "info")
         self.text.see("end")
-        # cap scrollback
         if int(self.text.index("end-1c").split(".")[0]) > 4000:
             self.text.delete("1.0", "500.0")
         self.text.configure(state="disabled")
@@ -188,7 +210,7 @@ class NetTable(ttk.Frame):
     def __init__(self, master, on_double):
         super().__init__(master)
         self.on_double = on_double
-        self.nets = []          # list of dicts from scanner
+        self.nets = []
         self.tree = ttk.Treeview(self, columns=COLS, show="headings",
                                  selectmode="browse")
         heads = {
@@ -294,8 +316,9 @@ class WispHoundGUI(tk.Tk):
         self._init_db()
         self.log.write("WispHound GUI ready.", "ok")
         if os.getuid() != 0:
-            self.log.write("WARNING: not running as root — wireless ops will fail.",
-                           "warn")
+            self.log.write(
+                "WARNING: not running as root — wireless ops will fail.",
+                "warn")
 
     # ---- helpers ---------------------------------------------------------
     @staticmethod
@@ -325,12 +348,6 @@ class WispHoundGUI(tk.Tk):
             self.progress.stop()
             self.progress["value"] = 0
 
-    def _set_progress(self, value, maximum=None):
-        if maximum:
-            self.progress["mode"] = "determinate"
-            self.progress["maximum"] = maximum
-        self.progress["value"] = value
-
     def _run_bg(self, fn):
         if self.busy:
             messagebox.showwarning("Busy", "An operation is already running.")
@@ -342,8 +359,11 @@ class WispHoundGUI(tk.Tk):
                 fn()
             except Exception as e:
                 self.log.write(f"FATAL: {e}", "err")
+                import traceback
+                traceback.print_exc()
             finally:
                 self._set_busy(False)
+
         threading.Thread(target=runner, daemon=True).start()
 
     # ---- layout ----------------------------------------------------------
@@ -421,8 +441,10 @@ class WispHoundGUI(tk.Tk):
         nb.add(t_log, text="  Log  ")
         bar = ttk.Frame(t_log)
         bar.pack(fill="x", pady=(2, 4))
-        ttk.Button(bar, text="Clear", command=lambda: self.log.clear()).pack(side="right")
-        ttk.Button(bar, text="Save…", command=self._save_log).pack(side="right", padx=6)
+        ttk.Button(bar, text="Clear",
+                   command=lambda: self.log.clear()).pack(side="right")
+        ttk.Button(bar, text="Save…",
+                   command=self._save_log).pack(side="right", padx=6)
         self.log = LogPane(t_log)
         self.log.pack(fill="both", expand=True)
 
@@ -496,12 +518,14 @@ class WispHoundGUI(tk.Tk):
         self.pin_tree.heading("algo", text="Algorithm")
         self.pin_tree.column("pin", width=110, anchor="center")
         self.pin_tree.column("algo", width=340, anchor="w")
-        self.pin_tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        self.pin_tree.pack(side="left", fill="both", expand=True,
+                           padx=8, pady=8)
         bf = ttk.Frame(pins)
         bf.pack(side="right", fill="y", padx=8, pady=8)
-        ttk.Button(bf, text="Generate", command=self.on_gen_pins).pack(fill="x")
-        ttk.Button(bf, text="Copy PIN", command=self.on_copy_pin).pack(
-            fill="x", pady=6)
+        ttk.Button(bf, text="Generate",
+                   command=self.on_gen_pins).pack(fill="x")
+        ttk.Button(bf, text="Copy PIN",
+                   command=self.on_copy_pin).pack(fill="x", pady=6)
 
     def _build_pixie(self, parent):
         top = ttk.Frame(parent)
@@ -527,23 +551,25 @@ class WispHoundGUI(tk.Tk):
             row, col = divmod(i, 2)
             required = i < len(req)
             lbl = ("* " if required else "") + name
-            ttk.Label(body, text=lbl,
-                      style="Head.TLabel" if required else "Dim.TLabel").grid(
-                row=row * 2, column=col, sticky="w", padx=8, pady=(6, 0))
+            ttk.Label(
+                body, text=lbl,
+                style="Head.TLabel" if required else "Dim.TLabel"
+            ).grid(row=row * 2, column=col, sticky="w", padx=8, pady=(6, 0))
             e = ttk.Entry(body, width=64, font=MONO)
-            e.grid(row=row * 2 + 1, column=col, sticky="we", padx=8, pady=(0, 4))
+            e.grid(row=row * 2 + 1, column=col, sticky="we",
+                   padx=8, pady=(0, 4))
             self.pixie_fields[name] = e
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
-        ttk.Label(parent,
-                  text=f"* required  ({sum(engine.PixiewpsData._REQUIRED_HEX_FIELDS.values())} hex chars for PKE/PKR, "
-                       "32 for nonces, 64 for hashes/authkey)",
-                  style="Dim.TLabel").pack(anchor="w", padx=20, pady=(0, 8))
+        ttk.Label(
+            parent,
+            text=f"* required  ({sum(engine.PixiewpsData._REQUIRED_HEX_FIELDS.values())} "
+                 "hex chars for PKE/PKR, 32 for nonces, 64 for hashes/authkey)",
+            style="Dim.TLabel").pack(anchor="w", padx=20, pady=(0, 8))
 
     # ---- engine glue -----------------------------------------------------
     def _args_shim(self):
-        """Return a lightweight argparse.Namespace-ish object."""
         class A:
             pass
         a = A()
@@ -563,22 +589,6 @@ class WispHoundGUI(tk.Tk):
         a.band = None
         return a
 
-    def _make_companion(self):
-        a = self._args_shim()
-        comp = engine.Companion(
-            a.interface,
-            save_result=a.write,
-            print_debug=a.verbose,
-            db=self.db,
-            json_mode=a.json,
-            trace_log=a.trace_log,
-            pixiewps_timeout=a.timeout,
-            cool_down=a.cool,
-            auto_mode=True)
-        # route Companion's prints into our log
-        original_print = comp.__dict__.get("print", None)
-        return comp
-
     # ---- scanning --------------------------------------------------------
     def on_scan(self):
         iface = self.interface.get()
@@ -595,19 +605,28 @@ class WispHoundGUI(tk.Tk):
                 result = scanner.iw_scanner()
             except Exception as e:
                 self.log.write(f"Scan error: {e}", "err")
+                import traceback
+                traceback.print_exc()
                 return
             if not result:
                 self.log.write("No networks found.", "warn")
                 self.status.set("No networks.")
                 return
             nets = list(result.values())
-            # annotate vendor
+            # iw_scanner() already populated 'Vendor' via db.vendor_for();
+            # fill any missing ones here.
             for n in nets:
-                n.setdefault("Vendor", self.db.vendor_for(n["BSSID"]))
+                if not n.get("Vendor"):
+                    try:
+                        n["Vendor"] = self.db.vendor_for(n["BSSID"])
+                    except Exception:
+                        n["Vendor"] = "Unknown"
             stored = scanner.stored
             self.after(0, lambda: self.table.populate(nets, stored))
             self.log.write(f"Found {len(nets)} AP(s).", "ok")
-            self.status.set(f"{len(nets)} AP(s) — double-click a row to target.")
+            self.status.set(
+                f"{len(nets)} AP(s) — double-click a row to target.")
+
         self._run_bg(job)
 
     def _on_select(self, _evt):
@@ -617,9 +636,10 @@ class WispHoundGUI(tk.Tk):
         self.target_bssid.set(n["BSSID"])
         if n.get("Channel"):
             self.target_channel.set(str(n["Channel"]))
-        self.log.write(f"Selected {n['BSSID']} "
-                       f"({n.get('ESSID', 'HIDDEN')}) ch={n.get('Channel', '?')}",
-                       "info")
+        self.log.write(
+            f"Selected {n['BSSID']} "
+            f"({n.get('ESSID', 'HIDDEN')}) ch={n.get('Channel', '?')}",
+            "info")
 
     def _target_dbl(self, net):
         self._on_select(None)
@@ -629,7 +649,8 @@ class WispHoundGUI(tk.Tk):
     def on_attack(self):
         bssid = self.target_bssid.get().strip()
         if not bssid:
-            messagebox.showinfo("Target", "Pick a target first (double-click a row).")
+            messagebox.showinfo(
+                "Target", "Pick a target first (double-click a row).")
             return
         if self.backend.get() != "internal":
             messagebox.showinfo(
@@ -681,19 +702,23 @@ class WispHoundGUI(tk.Tk):
 
             # 2) Brute-force
             if self.bruteforce.get():
-                self.log.write("Starting brute-force (this can take hours)…",
-                               "warn")
+                self.log.write(
+                    "Starting brute-force (this can take hours)…", "warn")
                 comp.smart_bruteforce(bssid, delay=None, loop=False,
                                       auto_resume=False)
                 if comp.connection_status.status == "GOT_PSK":
                     self._report_success(comp, bssid)
                     return
 
-            self.log.write(f"Attack finished without success for {bssid}.",
-                           "err")
+            self.log.write(
+                f"Attack finished without success for {bssid}.", "err")
             self.status.set("Attack finished — no credentials.")
         except KeyboardInterrupt:
             self.log.write("Attack interrupted.", "warn")
+        except Exception as e:
+            self.log.write(f"Attack error: {e}", "err")
+            import traceback
+            traceback.print_exc()
         finally:
             self.companion = None
             try:
@@ -702,7 +727,6 @@ class WispHoundGUI(tk.Tk):
                 pass
 
     def _report_success(self, comp, bssid):
-        pin = ""
         psk = comp.connection_status.wpa_psk
         essid = comp.connection_status.essid
         self.log.write("SUCCESS", "ok")
@@ -718,8 +742,9 @@ class WispHoundGUI(tk.Tk):
         bssid = self.target_bssid.get().strip() or None
         if not bssid:
             if not messagebox.askyesno(
-                    "PBC", "No BSSID set — try PBC against ANY AP? "
-                           "This can connect to unintended networks."):
+                    "PBC",
+                    "No BSSID set — try PBC against ANY AP? "
+                    "This can connect to unintended networks."):
                 return
         if self.backend.get() == "bully":
             messagebox.showerror("PBC", "bully does not support PBC.")
@@ -737,6 +762,8 @@ class WispHoundGUI(tk.Tk):
             self.companion = comp
             try:
                 comp.single_connection(bssid=bssid, pbc_mode=True)
+            except Exception as e:
+                self.log.write(f"PBC error: {e}", "err")
             finally:
                 self.companion = None
                 try:
@@ -747,6 +774,7 @@ class WispHoundGUI(tk.Tk):
                 self._report_success(comp, bssid or "PBC-AP")
             else:
                 self.log.write("PBC finished without success.", "err")
+
         self._run_bg(job)
 
     def on_stop(self):
@@ -773,8 +801,8 @@ class WispHoundGUI(tk.Tk):
         self.pin_tree.delete(*self.pin_tree.get_children())
         for p in pins:
             self.pin_tree.insert("", "end", values=(p["pin"], p["name"]))
-        self.log.write(f"Generated {len(pins)} suggested PIN(s) for {bssid}",
-                       "info")
+        self.log.write(
+            f"Generated {len(pins)} suggested PIN(s) for {bssid}", "info")
 
     def on_copy_pin(self):
         sel = self.pin_tree.selection()
@@ -787,19 +815,22 @@ class WispHoundGUI(tk.Tk):
 
     # ---- pixiewps --------------------------------------------------------
     def _read_pixie_fields(self):
-        return {k: e.get().strip() for k, e in self.pixie_fields.items() if e.get().strip()}
+        return {k: e.get().strip() for k, e in self.pixie_fields.items()
+                if e.get().strip()}
 
     def _clear_pixie(self):
         for e in self.pixie_fields.values():
             e.delete(0, "end")
 
     def _load_pixie_json(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
         if not path:
             return
         try:
+            import json as _json
             with open(path, "r", encoding="utf-8") as f:
-                data = engine.json.load(f)
+                data = _json.load(f)
             obj = engine.PixiewpsData.from_dict(data)
             for k, e in self.pixie_fields.items():
                 e.delete(0, "end")
@@ -811,8 +842,8 @@ class WispHoundGUI(tk.Tk):
             messagebox.showerror("Load", str(e))
 
     def _save_pixie_json(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json",
-                                            filetypes=[("JSON", "*.json")])
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("JSON", "*.json")])
         if not path:
             return
         try:
@@ -829,14 +860,16 @@ class WispHoundGUI(tk.Tk):
             return
         data = self._read_pixie_fields()
         if not data:
-            messagebox.showinfo("pixiewps", "Fill in the required fields first.")
+            messagebox.showinfo(
+                "pixiewps", "Fill in the required fields first.")
             return
 
         def job():
             obj = engine.PixiewpsData.from_dict(data)
             if not obj.got_all():
-                self.log.write("Not all required fields captured: "
-                               + ", ".join(obj.missing_fields()), "err")
+                self.log.write(
+                    "Not all required fields captured: "
+                    + ", ".join(obj.missing_fields()), "err")
                 return
             self.log.write("Running pixiewps…", "pixie")
             pin, psk = obj.run_pixiewps(
@@ -844,18 +877,19 @@ class WispHoundGUI(tk.Tk):
                 timeout=120, verbose=self.verbose.get())
             if pin:
                 self.log.write(f"WPS PIN recovered: {pin}", "ok")
-                self.pixie_fields.setdefault("_pin", None)  # no-op
                 messagebox.showinfo("Pixiewps", f"WPS PIN: {pin}")
             elif psk:
                 self.log.write(f"PSK recovered: {psk}", "ok")
+                messagebox.showinfo("Pixiewps", f"PSK: {psk}")
             else:
                 self.log.write("Pixiewps did not recover a PIN.", "err")
+
         self._run_bg(job)
 
     # ---- misc ------------------------------------------------------------
     def _save_log(self):
-        path = filedialog.asksaveasfilename(defaultextension=".log",
-                                            filetypes=[("Log", "*.log")])
+        path = filedialog.asksaveasfilename(
+            defaultextension=".log", filetypes=[("Log", "*.log")])
         if not path:
             return
         try:
@@ -866,6 +900,18 @@ class WispHoundGUI(tk.Tk):
             messagebox.showerror("Save", str(e))
 
     def destroy(self):
+        if self.busy:
+            if not messagebox.askyesno(
+                    "Quit", "A job is running. Quit anyway?"):
+                return
+        try:
+            if self.companion:
+                try:
+                    self.companion.sendOnly("WPS_CANCEL")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if self.db:
                 self.db.close()
@@ -877,6 +923,7 @@ class WispHoundGUI(tk.Tk):
 # ==========================================================================
 if __name__ == "__main__":
     if os.getuid() != 0:
-        print("[!] Run as root: sudo python3 wisphound_gui.py", file=sys.stderr)
+        print("[!] Run as root: sudo python3 wisphound_gui.py",
+              file=sys.stderr)
     app = WispHoundGUI()
     app.mainloop()
