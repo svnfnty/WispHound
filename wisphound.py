@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WispHound 2.1.2 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
+WispHound 2.1.3 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
 
-Changes vs 2.1.0:
-  * Pluggable Backends: 'reaver' and 'bully' alongside internal wpa_supplicant.
-  * Expanded Chipset Catalog (60+ signatures) and OUI Catalog (50+ prefixes).
-  * Channel & Frequency Tracking for 2.4/5/6 GHz; surfaced in tables, passed to reaver/bully (-c).
-  * Monitor Mode Management via airmon-ng or native iw/ip.
-
-Changes vs 2.1.1 (fixes the "No networks found." regression):
-  * REMOVED `iw ... scan --all` — that flag is a debug-dump toggle, not a band
-    expander, and is rejected by many Kali iw builds (`Invalid argument`),
-    which made iw_scanner() return False before parsing anything.
-  * REMOVED the `networks = [n for n in networks if n['WPS']]` filter.
-    Every visible AP (2.4/5/6 GHz) is now listed. WPS status is annotated
-    in a dedicated column; non-WPS rows are grey and selectable.
-  * Sort is fully .get()-based so a malformed beacon cannot raise KeyError.
-  * prompt_network() warns about non-WPS targets but no longer blocks them.
-  * The main-loop guard still refuses to *attack* a non-WPS AP (reaver,
-    bully and WPS_REG all require WPS) and tells the user why.
-
-UI redesign:
-  * Design system: ANSI colors, Unicode box-drawing tables, status badges.
-  * Progress spinners and progress bars for long-running operations.
-  * Re-laid-out network table and banner. Logic unchanged.
+Changes vs 2.1.2:
+  * [FIX] Reports directory is now resolved to a *writable* location
+    (~/.WispHound/reports → script-dir/reports → /tmp/wisphound-reports)
+    instead of blindly using script-dir/reports. This fixes
+    "cannot store on reports" on read-only installs (e.g. /usr/bin).
+  * [FIX] All save paths (__saveResult, _handle_backend_result) now:
+      - create the directory with error handling,
+      - catch OSError and print an explicit error,
+      - never silently swallow write failures.
+  * [FIX] WiFiScanner reads stored.csv from the *same* writable reports
+    dir that saves write to (was reading script-dir/reports).
+  * [FIX] auto_exploit() and __main__ use pick_reports_dir() so backend
+    credentials and internal-backend credentials land in the same place.
+  * [FIX] __savePin() wrapped in OSError handling.
 """
 import argparse
 import codecs
@@ -334,7 +326,47 @@ def vlen_safe(s):
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.1.2'
+VERSION = '2.1.3'
+
+
+# [FIX] Resolve a writable reports directory once, and cache it.
+_REPORTS_DIR_CACHE = None
+
+
+def pick_reports_dir(force_refresh=False):
+    """Return the first writable reports directory.
+
+    Order:
+      1. ~/.WispHound/reports
+      2. <script-dir>/reports
+      3. /tmp/wisphound-reports
+
+    Verifies writability by creating and deleting a probe file.
+    """
+    global _REPORTS_DIR_CACHE
+    if _REPORTS_DIR_CACHE and not force_refresh:
+        return _REPORTS_DIR_CACHE
+
+    candidates = [
+        os.path.join(str(pathlib.Path.home()), '.WispHound', 'reports'),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), 'reports'),
+        os.path.join(tempfile.gettempdir(), 'wisphound-reports'),
+    ]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, '.write_test')
+            with open(probe, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(probe)
+            _REPORTS_DIR_CACHE = d
+            return d
+        except OSError:
+            continue
+    # Last resort — return the temp path even if probing failed, so the
+    # caller can surface a precise error.
+    _REPORTS_DIR_CACHE = candidates[-1]
+    return _REPORTS_DIR_CACHE
 
 
 def _graceful_exit_handler(signum, frame):
@@ -1385,22 +1417,30 @@ def _handle_backend_result(result, bssid, db=None, save_result=False,
         print(json.dumps(rec, ensure_ascii=False), flush=True)
 
     if db:
-        db.save_credentials(bssid, result.essid, result.pin, result.psk)
+        try:
+            db.save_credentials(bssid, result.essid, result.pin, result.psk)
+        except Exception as e:
+            print(UI.msg('err', f'Failed to save credentials to DB: {e}'))
 
-    if save_result and reports_dir:
-        os.makedirs(reports_dir, exist_ok=True)
-        filename = os.path.join(reports_dir, 'stored')
-        dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
-        with open(filename + '.txt', 'a', encoding='utf-8') as f:
-            f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {result.essid}\n'
-                    f'WPS PIN: {result.pin}\nWPA PSK: {result.psk}\n\n')
-        header = not os.path.isfile(filename + '.csv')
-        with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
-            w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
-            if header:
-                w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
-            w.writerow([dateStr, bssid, result.essid, result.pin, result.psk])
-        print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'))
+    # [FIX] Always resolve the reports dir to a writable location.
+    if save_result:
+        reports_dir = reports_dir or pick_reports_dir()
+        try:
+            os.makedirs(reports_dir, exist_ok=True)
+            filename = os.path.join(reports_dir, 'stored')
+            dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
+            with open(filename + '.txt', 'a', encoding='utf-8') as f:
+                f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {result.essid}\n'
+                        f'WPS PIN: {result.pin}\nWPA PSK: {result.psk}\n\n')
+            header = not os.path.isfile(filename + '.csv')
+            with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                if header:
+                    w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
+                w.writerow([dateStr, bssid, result.essid, result.pin, result.psk])
+            print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'))
+        except OSError as e:
+            print(UI.msg('err', f'Failed to save credentials to {reports_dir}: {e}'))
 
     return True
 
@@ -1605,10 +1645,15 @@ class Companion:
         home = str(pathlib.Path.home())
         self.sessions_dir = os.path.join(home, '.WispHound', 'sessions')
         self.pixiewps_dir = os.path.join(home, '.WispHound', 'pixiewps')
-        self.reports_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), 'reports')
+
+        # [FIX] Use the writable reports dir picked at runtime.
+        self.reports_dir = pick_reports_dir()
         for d in (self.sessions_dir, self.pixiewps_dir, self.reports_dir):
-            os.makedirs(d, exist_ok=True)
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                # Will surface when actually writing.
+                pass
 
         self.db = db or TargetDB(os.path.join(home, '.WispHound', 'targets.db'))
         self._own_db = db is None
@@ -1900,28 +1945,46 @@ class Companion:
                         wpa_psk=wpa_psk, essid=essid)
 
     def __saveResult(self, bssid, essid, wps_pin, wpa_psk):
-        os.makedirs(self.reports_dir, exist_ok=True)
+        # [FIX] Make sure the directory exists and surface write errors.
+        try:
+            os.makedirs(self.reports_dir, exist_ok=True)
+        except OSError as e:
+            print(UI.msg('err', f'Cannot create reports dir {self.reports_dir}: {e}'))
+            return
         filename = os.path.join(self.reports_dir, 'stored')
         dateStr = datetime.now().strftime('%d.%m.%Y %H:%M')
-        with open(filename + '.txt', 'a', encoding='utf-8') as f:
-            f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {essid}\n'
-                    f'WPS PIN: {wps_pin}\nWPA PSK: {wpa_psk}\n\n')
-        header = not os.path.isfile(filename + '.csv')
-        with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
-            w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
-            if header:
-                w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
-            w.writerow([dateStr, bssid, essid, wps_pin, wpa_psk])
+        try:
+            with open(filename + '.txt', 'a', encoding='utf-8') as f:
+                f.write(f'{dateStr}\nBSSID: {bssid}\nESSID: {essid}\n'
+                        f'WPS PIN: {wps_pin}\nWPA PSK: {wpa_psk}\n\n')
+            header = not os.path.isfile(filename + '.csv')
+            with open(filename + '.csv', 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                if header:
+                    w.writerow(['Date', 'BSSID', 'ESSID', 'WPS PIN', 'WPA PSK'])
+                w.writerow([dateStr, bssid, essid, wps_pin, wpa_psk])
+        except OSError as e:
+            print(UI.msg('err', f'Failed to write credentials to {filename}: {e}'))
+            return
         print(UI.msg('info', f'Credentials saved to {filename}.txt, {filename}.csv'))
-        self.db.save_credentials(bssid, essid, wps_pin, wpa_psk)
+        try:
+            self.db.save_credentials(bssid, essid, wps_pin, wpa_psk)
+        except Exception as e:
+            print(UI.msg('err', f'Failed to save credentials to DB: {e}'))
         self._emit_json('credentials_saved', bssid=bssid,
                         essid=essid, wps_pin=wps_pin, wpa_psk=wpa_psk)
 
     def __savePin(self, bssid, pin):
+        # [FIX] Surface filesystem errors instead of crashing.
         filename = os.path.join(
             self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
-        with open(filename, 'w') as f:
-            f.write(pin)
+        try:
+            os.makedirs(self.pixiewps_dir, exist_ok=True)
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(pin)
+        except OSError as e:
+            print(UI.msg('err', f'Cannot save PIN to {filename}: {e}'))
+            return
         print(UI.msg('info', f'PIN saved in {filename}'))
         self._emit_json('pin_saved', bssid=bssid, pin=pin, path=filename)
 
@@ -2039,7 +2102,7 @@ class Companion:
                 try:
                     fn = os.path.join(
                         self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
-                    with open(fn, 'r') as f:
+                    with open(fn, 'r', encoding='utf-8') as f:
                         t_pin = f.readline().strip()
                     if self.auto_mode:
                         pin = t_pin
@@ -2158,7 +2221,7 @@ class Companion:
             try:
                 fn = os.path.join(
                     self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
-                with open(fn, 'r') as f:
+                with open(fn, 'r', encoding='utf-8') as f:
                     if auto_resume or self.auto_mode:
                         mask = f.readline().strip()
                         print(UI.msg('info', f'Resuming saved session for {bssid} (mask: {mask})'))
@@ -2189,9 +2252,13 @@ class Companion:
             print('\n' + UI.msg('warn', 'Aborting…'))
             fn = os.path.join(
                 self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
-            with open(fn, 'w') as f:
-                f.write(self.bruteforce.mask)
-            print(UI.msg('info', f'Session saved in {fn}'))
+            try:
+                os.makedirs(self.sessions_dir, exist_ok=True)
+                with open(fn, 'w', encoding='utf-8') as f:
+                    f.write(self.bruteforce.mask)
+                print(UI.msg('info', f'Session saved in {fn}'))
+            except OSError as e:
+                print(UI.msg('err', f'Cannot save session to {fn}: {e}'))
             if loop:
                 raise
 
@@ -2219,8 +2286,9 @@ class WiFiScanner:
         self.selected_wps = False
 
         self.stored = []
-        reports = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), 'reports', 'stored.csv')
+        # [FIX] Read stored.csv from the *same* writable reports dir that
+        #       saves write to.
+        reports = os.path.join(pick_reports_dir(), 'stored.csv')
         try:
             with open(reports, 'r', newline='',
                       encoding='utf-8', errors='replace') as f:
@@ -2417,14 +2485,6 @@ class WiFiScanner:
             rw = wcwidth.wcswidth(res)
             return res + ' ' * max(0, length - rw)
 
-        def colored(text, color=None):
-            codes = {'green': UI.GREEN, 'red': UI.RED,
-                     'yellow': UI.YELLOW, 'cyan': UI.CYAN,
-                     'grey': UI.GREY}
-            if color in codes and UI.enabled():
-                return f'{codes[color]}{text}{UI.RESET}'
-            return text
-
         # Legend
         legend = '  '.join([
             UI.ok('● vulnerable'),
@@ -2536,7 +2596,8 @@ def auto_exploit(interface, args, db):
                                   -n.get('Level', -100)))
 
     backend = getattr(args, 'backend', BACKEND_INTERNAL)
-    reports_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'reports')
+    # [FIX] Use the same writable reports dir the internal backend uses.
+    reports_dir = pick_reports_dir()
 
     if backend in (BACKEND_REAVER, BACKEND_BULLY):
         attacker_cls = ReaverAttacker if backend == BACKEND_REAVER else BullyAttacker
@@ -2759,8 +2820,8 @@ if __name__ == '__main__':
                 selected_wps = True
 
                 if args.pbc:
-                    reports_dir = os.path.join(
-                        os.path.dirname(os.path.realpath(__file__)), 'reports')
+                    # [FIX] Use the writable reports dir.
+                    reports_dir = pick_reports_dir()
                     if args.backend == 'internal':
                         comp = Companion(
                             args.interface, args.write,
@@ -2827,8 +2888,8 @@ if __name__ == '__main__':
                         args.bssid = None
                         continue
 
-                    reports_dir = os.path.join(
-                        os.path.dirname(os.path.realpath(__file__)), 'reports')
+                    # [FIX] Use the writable reports dir.
+                    reports_dir = pick_reports_dir()
 
                     if args.backend in (BACKEND_REAVER, BACKEND_BULLY):
                         attacker_cls = ReaverAttacker if args.backend == BACKEND_REAVER else BullyAttacker
